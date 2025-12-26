@@ -14,6 +14,8 @@ dependencies:
     sdk: flutter
   web: ^1.0.0
   plugin_platform_interface: ^2.0.2
+  #加载
+  flutter_easyloading: ^3.0.5
 
 dev_dependencies:
   flutter_test:

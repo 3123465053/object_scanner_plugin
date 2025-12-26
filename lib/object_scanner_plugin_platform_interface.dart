@@ -27,7 +27,7 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 
-   startScanner() {
+  startScannerObject() {
     throw UnimplementedError('startScanner has not been implemented.');
   }
 

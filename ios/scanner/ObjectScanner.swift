@@ -1,20 +1,9 @@
-//
-//  ObjectScanner 2.swift
-//  Pods
-//
-//  Created by 杨棒 on 2025/12/25.
-//
-
-
-
-//  AppModel.swift
-//  Pods
-
 import SwiftUI
 import RealityKit
 import Combine
 import SceneKit
 
+//扫描单个物体
 @available(iOS 17.0, *)
 @MainActor
 class ObjectScanner: ObservableObject {
@@ -35,24 +24,24 @@ class ObjectScanner: ObservableObject {
         // 必须设置 checkpointDirectory 才能进行本地重建
         session.start(imagesDirectory: folder, configuration: config)
     }
-
+    
     // --- 手动结束捕获 ---
     func stopCaptureAndStartReconstruction() {
         // 1. 停止捕获
-            session.finish()
-            // 2. 关键：延迟或确保 UI 已经停止渲染相机画面
-            // 在某些情况下，需要将 session 引用断开来释放 GPU
-            // self.session = ObjectCaptureSession() // 或者在 AppModel 里设为可选型并置 nil
-            
-            isReconstructing = true
-            
-            Task {
-                // 给系统一点时间回收相机资源（约 0.5 秒）
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                await self.runReconstruction()
-            }
+        session.finish()
+        // 2. 关键：延迟或确保 UI 已经停止渲染相机画面
+        // 在某些情况下，需要将 session 引用断开来释放 GPU
+        
+        isReconstructing = true
+        
+        Task {
+            // 给系统一点时间回收相机资源（约 0.5 秒）
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            //结束后就从简
+            await self.runReconstruction()
+        }
     }
-
+    
     private func runReconstruction() async {
         guard let inputFolder = scanFolder else { return }
         let outputFile = inputFolder.appendingPathComponent("Model.usdz")
@@ -89,6 +78,7 @@ class ObjectScanner: ObservableObject {
         } catch {
             print("重建初始化失败: \(error)")
             self.isReconstructing = false
+            self.outputFile = ""
         }
     }
 }
@@ -97,29 +87,24 @@ class ObjectScanner: ObservableObject {
 @available(iOS 17.0, *)
 struct ObjectScannerView: View {
     @StateObject private var objectScanner = ObjectScanner()
-    
     @Environment(\.dismiss) private var dismiss
+    
+    @State var showProgressView:Bool = false
     
     var body: some View {
         ZStack {
             ObjectCaptureView(session: objectScanner.session)
                 .ignoresSafeArea()
             
+            //黑色背景
+            if objectScanner.isReconstructing {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+            }
+            
             VStack {
-                if objectScanner.isReconstructing {
-                    // 重建中的进度条
-                    VStack {
-                        ProgressView(value: objectScanner.progress)
-                            .progressViewStyle(.linear)
-                            .padding()
-                        Text("正在生成 3D 模型: \(Int(objectScanner.progress * 100))%")
-                        
-                        
-                    }
-                    .background(.ultraThinMaterial)
-                    .cornerRadius(12)
-                    .padding()
-                } else {
+                //没有在重建的时候显示
+                if  !objectScanner.isReconstructing{
                     Spacer()
                     
                     // 控制按钮
@@ -141,19 +126,25 @@ struct ObjectScannerView: View {
                             .foregroundColor(.white)
                             .cornerRadius(12)
                         } else
-                          {
-                          Text("默认文本")
+                        {
+                            Text("默认文本")
                         }
                     }
                     .padding(.bottom, 40)
                 }
+
             }
         }
         .onAppear { objectScanner.prepareAndStart() }
+        .onChange(of: objectScanner.isReconstructing, { _, newValue in
+            if newValue {
+                showProgressView = true
+            }
+        })
         .onChange(of: objectScanner.outputFile) { oldValue, newValue in
             
-          print(newValue)
-             dismiss()
+            print(newValue)
+            dismiss()
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3){
                 ObjectScannerPlugin.pendingResult?([
@@ -163,6 +154,47 @@ struct ObjectScannerView: View {
                 // ⚠️ 一定要清空，防止重复调用
                 ObjectScannerPlugin.pendingResult = nil
             }
+        }
+        .sheet(isPresented: $showProgressView) {
+            GenerateProgressView(progress: $objectScanner.progress)
+        }
+    }
+}
+
+@available(iOS 15.0, *)
+struct GenerateProgressView:View {
+    
+    @Binding var progress:Double
+    @Environment(\.dismiss) private var dismiss
+    
+    var body: some View {
+        ZStack(alignment:.topLeading) {
+            
+            VStack{
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .padding()
+                Text("正在生成 3D 模型: \(Int(progress * 100))%")
+            }
+            .interactiveDismissDisabled(true)  //为true 不能通过手势下拉的方式关闭弹窗
+            
+            Button("关闭"){
+             dismiss()
+            }
+            .glassIfAvailable()
+            .padding()
+        }
+    }
+}
+
+
+extension View {
+    @ViewBuilder
+    func glassIfAvailable() -> some View {
+        if #available(iOS 26.0, *) {
+            self.buttonStyle(.glass)
+        } else {
+            self.buttonStyle(.automatic)
         }
     }
 }

@@ -3,8 +3,10 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 import 'package:object_scanner_plugin/object_scanner_plugin.dart';
+import 'package:flutter_easyloading/flutter_easyloading.dart';
 
 void main() {
+  configLoading();
   runApp(const MyApp());
 }
 
@@ -59,9 +61,17 @@ class _MyAppState extends State<MyApp> {
               Text('Running on: $_platformVersion\n'),
               ElevatedButton(
                 onPressed: () async {
-                  var res = await _objectScannerPlugin.startScanner();
-                  print("sfsfsss");
-                  print(res);
+                  try {
+                    EasyLoading.show(status: "loading...");
+                    var res = await _objectScannerPlugin.startScannerObject();
+                    EasyLoading.dismiss();
+                    print("sfsfsss");
+                    print(res);
+                  } catch (e) {
+                    print("sfdd");
+                    print(e);
+                    EasyLoading.dismiss();
+                  }
                 },
                 child: Text("开始扫描"),
               ),
@@ -69,6 +79,26 @@ class _MyAppState extends State<MyApp> {
           ),
         ),
       ),
+      builder: EasyLoading.init(builder: (context, widget) {
+        return MediaQuery(
+          data: MediaQuery.of(context).copyWith(textScaleFactor: 1.0),
+          child: widget!,
+        );
+      }),
     );
   }
+}
+
+void configLoading() {
+  EasyLoading.instance
+    ..indicatorType = EasyLoadingIndicatorType.fadingCircle
+    ..loadingStyle = EasyLoadingStyle.custom
+    ..radius = 10.0
+    ..progressColor = Colors.black
+    ..backgroundColor = Colors.grey.shade200
+    ..indicatorColor = Color(0xff000000)
+    ..textColor = Color(0xff000000)
+    ..userInteractions = false
+    ..dismissOnTap = false
+    ..animationStyle = EasyLoadingAnimationStyle.scale;
 }

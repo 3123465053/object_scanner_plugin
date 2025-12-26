@@ -5,7 +5,9 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.getPlatformVersion();
   }
 
-    startScanner() {
-    return ObjectScannerPluginPlatform.instance.startScanner();
+  //扫描单个物体
+  startScannerObject() {
+    return ObjectScannerPluginPlatform.instance.startScannerObject();
   }
+
 }

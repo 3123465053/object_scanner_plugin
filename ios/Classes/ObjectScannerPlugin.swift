@@ -25,14 +25,12 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin {
     switch call.method {
     case "getPlatformVersion":
       result("iOS " + UIDevice.current.systemVersion)
-    case "startScanner":
+    case "startScannerObject":
         StartScanner.scannerObject(result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
   }
-   
-
 }
 
 

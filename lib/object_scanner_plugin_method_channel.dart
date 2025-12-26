@@ -17,11 +17,9 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
 
   //开始扫描
   @override
-   startScanner()async{
-    print("开始");
-   var res = await  methodChannel.invokeMethod("startScanner");
-   print("safdsdd");
-   print(res);
+  startScannerObject()async{
+   var res = await  methodChannel.invokeMethod("startScannerObject");
+
    return res;
   }
 }

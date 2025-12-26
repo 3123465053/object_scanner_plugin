@@ -12,7 +12,7 @@ class MockObjectScannerPluginPlatform
   Future<String?> getPlatformVersion() => Future.value('42');
 
   @override
-  Future<bool?> startScanner() {
+  Future<bool?> startScannerObject() {
     // TODO: implement startScanner
     throw UnimplementedError();
   }
