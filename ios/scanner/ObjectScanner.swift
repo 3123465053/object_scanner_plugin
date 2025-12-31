@@ -12,7 +12,8 @@ class ObjectScanner: ObservableObject {
     @Published var progress: Double = 0.0
     @Published var outputFile:String = "path"
     var scanFolder: URL?
-    
+    // ⭐️ 关键：保存重建会话 （用来取消重建的）
+       private var photogrammetrySession: PhotogrammetrySession?
     //初始化设置
     func prepareAndStart() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -42,6 +43,7 @@ class ObjectScanner: ObservableObject {
         }
     }
     
+    //开始重建
     private func runReconstruction() async {
         guard let inputFolder = scanFolder else { return }
         let outputFile = inputFolder.appendingPathComponent("Model.usdz")
@@ -53,11 +55,13 @@ class ObjectScanner: ObservableObject {
         do {
             // 使用 .reduced 确保 iPhone 内存安全
             let request = PhotogrammetrySession.Request.modelFile(url: outputFile, detail: .reduced)
-            let photogrammetrySession = try PhotogrammetrySession(input: inputFolder)
+            let session = try PhotogrammetrySession(input: inputFolder)
             
-            try photogrammetrySession.process(requests: [request])
+            self.photogrammetrySession = session
+             
+            try session.process(requests: [request])
             
-            for try await output in photogrammetrySession.outputs {
+            for try await output in session.outputs {
                 switch output {
                 case .requestProgress(_, let fraction):
                     self.progress = fraction
@@ -71,7 +75,6 @@ class ObjectScanner: ObservableObject {
                     self.isReconstructing = false
                     self.outputFile = ""
                 default:
-                    self.outputFile = ""
                     break
                 }
             }
@@ -81,6 +84,17 @@ class ObjectScanner: ObservableObject {
             self.outputFile = ""
         }
     }
+    
+    //取消重建
+    func cancelReconstruction() {
+        guard isReconstructing else { return }
+
+        print("⛔️ 取消模型重建")
+        photogrammetrySession?.cancel()
+        photogrammetrySession = nil
+        isReconstructing = false
+    }
+
 }
 
 
@@ -96,11 +110,6 @@ struct ObjectScannerView: View {
             ObjectCaptureView(session: objectScanner.session)
                 .ignoresSafeArea()
             
-            //黑色背景
-            if objectScanner.isReconstructing {
-                Color.black.opacity(0.4)
-                    .ignoresSafeArea()
-            }
             
             VStack {
                 //没有在重建的时候显示
@@ -131,10 +140,13 @@ struct ObjectScannerView: View {
                         }
                     }
                     .padding(.bottom, 40)
+                } else {
+                    Text("")
                 }
-
+                
             }
         }
+        //生命周期函数 开始时执行
         .onAppear { objectScanner.prepareAndStart() }
         .onChange(of: objectScanner.isReconstructing, { _, newValue in
             if newValue {
@@ -142,8 +154,9 @@ struct ObjectScannerView: View {
             }
         })
         .onChange(of: objectScanner.outputFile) { oldValue, newValue in
-            
+            print("dsafddssds");
             print(newValue)
+            
             dismiss()
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3){
@@ -155,6 +168,20 @@ struct ObjectScannerView: View {
                 ObjectScannerPlugin.pendingResult = nil
             }
         }
+        .onChange(of: showProgressView, { oldValue, newValue in
+            //之前是显示的底部弹窗进度条 现在不显示 则说明是关闭了弹窗
+            if oldValue && !newValue {
+                objectScanner.cancelReconstruction();
+                dismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3){
+                    ObjectScannerPlugin.pendingResult?([
+                        "path":"",
+                        "msg":"重建取消"
+                    ])
+                    // ⚠️ 一定要清空，防止重复调用
+                    ObjectScannerPlugin.pendingResult = nil
+                }}
+        })
         .sheet(isPresented: $showProgressView) {
             GenerateProgressView(progress: $objectScanner.progress)
         }
@@ -171,15 +198,17 @@ struct GenerateProgressView:View {
         ZStack(alignment:.topLeading) {
             
             VStack{
+                Spacer()
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
                     .padding()
                 Text("正在生成 3D 模型: \(Int(progress * 100))%")
+                Text("(关闭会停止模型生成)")
+                Spacer()
             }
             .interactiveDismissDisabled(true)  //为true 不能通过手势下拉的方式关闭弹窗
-            
             Button("关闭"){
-             dismiss()
+                dismiss()
             }
             .glassIfAvailable()
             .padding()
@@ -187,7 +216,7 @@ struct GenerateProgressView:View {
     }
 }
 
-
+//液态玻璃效果是否可用
 extension View {
     @ViewBuilder
     func glassIfAvailable() -> some View {
