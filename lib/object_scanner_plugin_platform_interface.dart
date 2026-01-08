@@ -2,6 +2,7 @@ import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'object_scanner_plugin_method_channel.dart';
 
+//虚类
 abstract class ObjectScannerPluginPlatform extends PlatformInterface {
   /// Constructs a ObjectScannerPluginPlatform.
   ObjectScannerPluginPlatform() : super(token: _token);
@@ -28,7 +29,11 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
   }
 
   startScannerObject() {
-    throw UnimplementedError('startScanner has not been implemented.');
+    throw UnimplementedError('startScannerObject has not been implemented.');
+  }
+
+  startScannerRoom() {
+    throw UnimplementedError('startScannerRoom has not been implemented.');
   }
 
 }

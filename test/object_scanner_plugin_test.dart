@@ -16,6 +16,12 @@ class MockObjectScannerPluginPlatform
     // TODO: implement startScanner
     throw UnimplementedError();
   }
+
+  @override
+  startScannerRoom() {
+    // TODO: implement startScannerRoom
+    throw UnimplementedError();
+  }
 }
 
 void main() {

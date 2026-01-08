@@ -75,6 +75,22 @@ class _MyAppState extends State<MyApp> {
                 },
                 child: Text("开始扫描"),
               ),
+              ElevatedButton(
+                onPressed: () async {
+                  try {
+                    EasyLoading.show(status: "loading...");
+                    var res = await _objectScannerPlugin.startScannerRoom();
+                    EasyLoading.dismiss();
+                    print("sfsfsss");
+                    print(res);
+                  } catch (e) {
+                    print("sfdd");
+                    print(e);
+                    EasyLoading.dismiss();
+                  }
+                },
+                child: Text("扫描房间"),
+              ),
             ],
           ),
         ),

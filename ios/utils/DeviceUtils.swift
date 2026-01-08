@@ -1,13 +1,12 @@
 //
 //  File.swift
 //  object_scanner_plugin
-//
-//  Created by 杨棒 on 2026/1/6.
-//
+
 
 import Foundation
 import AVFoundation
 
+//设备相关
 struct DeviceUtils {
     //打开或者关闭手电筒
   

@@ -27,6 +27,8 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin {
       result("iOS " + UIDevice.current.systemVersion)
     case "startScannerObject":
         StartScanner.scannerObject(result: result)
+    case "startScannerRoom":
+        StartScanner.scannerRoom(result: result)
     default:
       result(FlutterMethodNotImplemented)
     }

@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import 'object_scanner_plugin_platform_interface.dart';
 
+//具体的实现
 /// An implementation of [ObjectScannerPluginPlatform] that uses method channels.
 class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
   /// The method channel used to interact with the native platform.
@@ -20,5 +21,12 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
   startScannerObject()async{
    var res = await  methodChannel.invokeMethod("startScannerObject");
    return res;
+  }
+
+  //开始扫描房间
+  @override
+  startScannerRoom() async{
+    var res = await  methodChannel.invokeMethod("startScannerRoom");
+    return res;
   }
 }
