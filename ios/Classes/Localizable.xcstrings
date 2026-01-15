@@ -1,0 +1,83 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "" : {
+
+    },
+    "(关闭会停止模型生成)" : {
+
+    },
+    "%lld/%lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld/%2$lld"
+          }
+        }
+      }
+    },
+    "Key" : {
+      "extractionState" : "manual"
+    },
+    "Key 1" : {
+      "extractionState" : "manual"
+    },
+    "关闭" : {
+
+    },
+    "取消" : {
+
+    },
+    "图片数量过少，模型生成可能不成功，请确保有10张以上的图片" : {
+
+    },
+    "完成扫描" : {
+
+    },
+    "开始捕捉" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start Scanner"
+          }
+        }
+      }
+    },
+    "提示" : {
+
+    },
+    "正在生成 3D 模型: %lld%%" : {
+
+    },
+    "此设备不支持 LiDAR 技术" : {
+
+    },
+    "立即生成" : {
+
+    },
+    "结束并生成模型" : {
+
+    },
+    "设备不支持" : {
+
+    },
+    "设备不支持 RoomPlan" : {
+
+    },
+    "请将中心点对准物体" : {
+
+    },
+    "需要 iPhone 12 Pro 或更新的设备" : {
+
+    },
+    "需要支持 LiDAR 的设备\n(iPhone 12 Pro 及以上)" : {
+
+    },
+    "默认文本" : {
+
+    }
+  },
+  "version" : "1.1"
+}

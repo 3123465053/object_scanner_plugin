@@ -21,6 +21,7 @@ class RoomController: NSObject, ObservableObject, RoomCaptureViewDelegate, NSCod
     
     override init() {
         captureView = RoomCaptureView(frame: .zero)
+
         super.init()
         captureView.delegate = self
         print("🎯 RoomController 初始化完成")
@@ -37,7 +38,7 @@ class RoomController: NSObject, ObservableObject, RoomCaptureViewDelegate, NSCod
     }
     
     // MARK: - RoomCaptureViewDelegate 方法
-    
+    //回调方法 每次有数据到达时调用
     func captureView(shouldPresent roomDataForProcessing: CapturedRoomData, error: Error?) -> Bool {
         print("📋 shouldPresent 被调用")
         if let error = error {
@@ -49,6 +50,7 @@ class RoomController: NSObject, ObservableObject, RoomCaptureViewDelegate, NSCod
         return true
     }
     
+    //回调方法 扫描完成时调用
     func captureView(didPresent processedResult: CapturedRoom, error: Error?) {
         print("✅ didPresent 被调用")
         DispatchQueue.main.async {
@@ -108,8 +110,8 @@ class RoomController: NSObject, ObservableObject, RoomCaptureViewDelegate, NSCod
         }
     }
     
-    // MARK: - 导出功能
     
+    // MARK: - 导出功能
     private func exportRoom(_ capturedRoom: CapturedRoom) {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let timestamp = Int(Date().timeIntervalSince1970)
@@ -120,17 +122,25 @@ class RoomController: NSObject, ObservableObject, RoomCaptureViewDelegate, NSCod
             print("✅ 房间导出成功: \(url)")
             DispatchQueue.main.async {
                 self.scanningProgress = "✅ 已导出到: \(url.lastPathComponent)"
+                ObjectScannerPlugin.pendingResult?([
+                    "path":url.relativePath,
+                    "msg": "success"
+                ])
             }
         } catch {
             print("❌ 导出失败: \(error)")
             DispatchQueue.main.async {
                 self.errorMessage = "导出失败: \(error.localizedDescription)"
+                ObjectScannerPlugin.pendingResult?([
+                    "path": "",
+                    "msg": "文件导出失败"
+                ])
             }
         }
     }
 }
 
-// MARK: - RoomCaptureView SwiftUI 包装器
+// MARK: - RoomCaptureView SwiftUI 包装器（桥接文件）
 @available(iOS 16.0, *)
 struct RoomCaptureViewRepresentable: UIViewRepresentable {
     
@@ -146,6 +156,7 @@ struct RoomCaptureViewRepresentable: UIViewRepresentable {
     }
 }
 
+
 // MARK: - 主扫描界面
 @available(iOS 16.0, *)
 struct RoomScannerView: View {
@@ -153,29 +164,34 @@ struct RoomScannerView: View {
     @ObservedObject var roomController = RoomController.instance
     @State private var showingPermissionAlert = false
     @State private var showingInfoAlert = false
+    @Environment(\.dismiss) private var dismiss
+    //是否打开手电筒
+    @State var onLight = false
     
     var body: some View {
-  
+        
         ZStack(alignment:.topLeading) {
-                // 扫描区域
-                scanningArea
-                
-                // 底部控制区域
-                bottomControls
-            }
-            .ignoresSafeArea()
-            .onAppear {
-                checkPermissions()
-                // 页面出现时自动开始扫描（如果权限已授予）
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    if RoomCaptureSession.isSupported && 
-                       AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
-                        roomController.startSession()
-                    }
+            // 扫描区域
+            scanningArea
+            
+            // 底部控制区域
+            bottomControls
+            
+            // 顶部控制区域
+            topActionBtn
+        }
+        .onAppear {
+            checkPermissions()
+            // 页面出现时自动开始扫描（如果权限已授予）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                if RoomCaptureSession.isSupported &&
+                    AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                    roomController.startSession()
                 }
             }
-            
         }
+        
+    }
     
     
     private var scanningArea: some View {
@@ -206,7 +222,7 @@ struct RoomScannerView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.gray.opacity(0.3))
             }
-        }
+        }.ignoresSafeArea()
     }
     
     private var bottomControls: some View {
@@ -215,6 +231,7 @@ struct RoomScannerView: View {
             HStack(spacing: 20) {
                 if roomController.isScanning {
                     Button("完成扫描") {
+                        dismiss()
                         roomController.stopSession()
                     }
                     .font(.headline)
@@ -223,34 +240,63 @@ struct RoomScannerView: View {
                     .padding(.vertical, 12)
                     .background(Color.red)
                     .cornerRadius(25)
-                } else {
-                    // 扫描完成后显示重新扫描按钮
-                    Button("重新扫描") {
-                        roomController.startSession()
-                    }
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-                    .background(Color.blue)
-                    .cornerRadius(25)
-                    .disabled(!RoomCaptureSession.isSupported)
                 }
+//                else {
+//                    // 扫描完成后显示重新扫描按钮
+//                    Button("重新扫描") {
+//                        roomController.startSession()
+//                    }
+//                    .font(.headline)
+//                    .foregroundColor(.white)
+//                    .padding(.horizontal, 24)
+//                    .padding(.vertical, 12)
+//                    .background(Color.blue)
+//                    .cornerRadius(25)
+//                    .disabled(!RoomCaptureSession.isSupported)
+//                }
             }
             
             // 扫描结果信息
-            if let result = roomController.finalResult {
-                VStack(spacing: 4) {
-                    
-                    Text("检测到 \(result.walls.count) 面墙，\(result.objects.count) 个物体")
-                        .font(.caption2)
-                        .foregroundColor(.gray)
-                }
-            }
+//            if let result = roomController.finalResult {
+//                VStack(spacing: 4) {
+//                    
+//                    Text("检测到 \(result.walls.count) 面墙，\(result.objects.count) 个物体")
+//                        .font(.caption2)
+//                        .foregroundColor(.gray)
+//                }
+//            }
         }
         .padding(.bottom, 40)
         .frame(maxWidth: .infinity)
+        
+    }
     
+    //关闭按钮
+    var topActionBtn: some View {
+        HStack{
+            
+            Button("关闭"){
+                dismiss()
+                ObjectScannerPlugin.pendingResult?([
+                    "path":"",
+                    "msg":"关闭扫描界面"
+                ])
+                // ⚠️ 一定要清空，防止重复调用
+                ObjectScannerPlugin.pendingResult = nil
+            }
+            .glassIfAvailable()
+            Spacer()
+            Image(systemName: onLight ? "flashlight.on.fill" : "flashlight.off.fill")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundStyle(.white)
+                .frame(width:18)
+                .onTapGesture {
+                    onLight.toggle()
+                    DeviceUtils.setTorch(on: onLight)
+                }
+        }.padding()
+        
     }
     
     // MARK: - 辅助方法

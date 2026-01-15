@@ -278,25 +278,21 @@ struct ObjectScannerView: View {
             }
             .glassIfAvailable()
             Spacer()
-            VStack{
-                Image(systemName: onLight ? "flashlight.on.fill" : "flashlight.off.fill")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
+            if case .ready = objectScanner.session?.state
+            {
+                Text("请将中心点对准物体")
                     .foregroundStyle(.white)
-                    .frame(width:20)
-                    .onTapGesture {
-                        onLight.toggle()
-                        DeviceUtils.setTorch(on: onLight)
-                    }
-                if case .ready = objectScanner.session?.state
-                {
-                    Text("请将中心点对准物体")
-                        .foregroundStyle(.white)
-                }
             }
             Spacer()
-            Text("")
-                .frame(width:30)
+            Image(systemName: onLight ? "flashlight.on.fill" : "flashlight.off.fill")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundStyle(.white)
+                .frame(width:18)
+                .onTapGesture {
+                    onLight.toggle()
+                    DeviceUtils.setTorch(on: onLight)
+                }
         }.padding()
         
     }
