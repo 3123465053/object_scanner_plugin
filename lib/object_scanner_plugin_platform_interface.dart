@@ -36,4 +36,8 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('startScannerRoom has not been implemented.');
   }
 
+  startScannerSpace() {
+    throw UnimplementedError('startScannerSpace has not been implemented.');
+  }
+
 }

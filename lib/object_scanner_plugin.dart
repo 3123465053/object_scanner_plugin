@@ -16,4 +16,9 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.startScannerRoom();
   }
 
+  //扫描房间
+  startScannerSpace() {
+    return ObjectScannerPluginPlatform.instance.startScannerSpace();
+  }
+
 }

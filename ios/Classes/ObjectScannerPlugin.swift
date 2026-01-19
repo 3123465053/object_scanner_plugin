@@ -19,6 +19,12 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin {
     //并且被注册为 MethodCallDelegate
     //Flutter 引擎就只会调用它的 handle()
     registrar.addMethodCallDelegate(instance, channel: channel)
+      
+// 注册 PlatformView，用于 Flutter 嵌入 SwiftUI
+    registrar.register(
+             SwiftUIFactory(messenger: registrar.messenger()),
+             withId: "swift_ui_view"
+    )
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -29,6 +35,17 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin {
         StartScanner.scannerObject(result: result)
     case "startScannerRoom":
         StartScanner.scannerRoom(result: result)
+    case "startScannerSpace":
+        StartScanner.scannerSpace(result: result)
+    case "openUSDZ":
+           guard let args = call.arguments as? [String: Any],
+                 let path = args["path"] as? String
+                 else {
+               result(FlutterError(code: "INVALID_ARGS", message: "Path is required", details: nil))
+               return
+           }
+        StartScanner.openUSDZ(result: result, path: path)
+           result(nil)
     default:
       result(FlutterMethodNotImplemented)
     }

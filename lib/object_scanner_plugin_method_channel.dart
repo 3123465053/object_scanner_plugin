@@ -29,4 +29,11 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
     var res = await  methodChannel.invokeMethod("startScannerRoom");
     return res;
   }
+
+  //开始空间扫描
+  @override
+  startScannerSpace()async {
+    var res = await  methodChannel.invokeMethod("startScannerSpace");
+    return res;
+  }
 }

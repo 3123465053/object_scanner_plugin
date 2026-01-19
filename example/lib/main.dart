@@ -20,7 +20,7 @@ class MyApp extends StatefulWidget {
 class _MyAppState extends State<MyApp> {
   String _platformVersion = 'Unknown';
   final _objectScannerPlugin = ObjectScannerPlugin();
-
+  String? path="";
   @override
   void initState() {
     super.initState();
@@ -67,6 +67,9 @@ class _MyAppState extends State<MyApp> {
                     EasyLoading.dismiss();
                     print("sfsfsss");
                     print(res);
+                    setState(() {
+                      path=res["path"];
+                    });
                   } catch (e) {
                     print("sfdd");
                     print(e);
@@ -83,6 +86,9 @@ class _MyAppState extends State<MyApp> {
                     EasyLoading.dismiss();
                     print("sfsfsss");
                     print(res);
+                    setState(() {
+                      path=res["path"];
+                    });
                   } catch (e) {
                     print("sfdd");
                     print(e);
@@ -91,6 +97,44 @@ class _MyAppState extends State<MyApp> {
                 },
                 child: Text("扫描房间"),
               ),
+              ElevatedButton(
+                onPressed: () async {
+                  try {
+                    EasyLoading.show(status: "loading...");
+                    var res = await _objectScannerPlugin.startScannerSpace();
+                    EasyLoading.dismiss();
+                    print("sfsfsss");
+                    print(res);
+                    setState(() {
+                      path=res["path"];
+                    });
+                  } catch (e) {
+                    print("sfdd");
+                    print(e);
+                    EasyLoading.dismiss();
+                  }
+                },
+                child: Text("扫描空间"),
+              ),
+
+              if(path!=null&&path!.isNotEmpty)
+                SizedBox(
+                  width: double.infinity,
+                  height: 400,
+                  child: UiKitView(
+                    key: ValueKey(path),
+                    viewType: "swift_ui_view",
+                    //creationParams: {"view_type":"usdz_preview_view","path": path},
+                    onPlatformViewCreated: (id) {
+                      // 通过 MethodChannel 传参给 iOS
+                      MethodChannel('swift_ui_view_$id')
+                          .invokeMethod('setParams', {'view_type': 'usdz_preview_view', 'path': path});
+                    },
+                    creationParamsCodec: StandardMessageCodec(),
+                  ),
+                )
+
+
             ],
           ),
         ),
