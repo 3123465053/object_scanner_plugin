@@ -67,7 +67,7 @@ struct StartScanner{
     //空间扫描
     static func scannerSpace(result: @escaping FlutterResult){
         if #available(iOS 17.0, *) {
-            print("IOS: 开始空间扫描");
+            print("IOS: 开始空间扫描 (RealityKit)");
             
             // 保存 result，等扫描完成后再回调
             ObjectScannerPlugin.pendingResult = result
@@ -85,7 +85,7 @@ struct StartScanner{
             print("IOS: 当前设备系统版本不支持");
             result([
                 "path":nil,
-                "msg":"当前设备系统版本不支持"
+                "msg":"当前设备系统版本不支持，需要 iOS 14.0+"
             ])
         }
     }

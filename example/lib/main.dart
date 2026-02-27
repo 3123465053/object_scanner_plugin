@@ -108,6 +108,7 @@ class _MyAppState extends State<MyApp> {
                     setState(() {
                       path=res["path"];
                     });
+                    print(path);
                   } catch (e) {
                     print("sfdd");
                     print(e);
@@ -134,7 +135,9 @@ class _MyAppState extends State<MyApp> {
                   ),
                 )
 
+          // /private/var/mobile/Containers/Data/Application/299FE8F8-45C6-4891-BD82-243B9EED7BFE/tmp/scan_1769481744.2101622.usdz
 
+            // /var/mobile/Containers/Data/Application/299FE8F8-45C6-4891-BD82-243B9EED7BFE/Documents/room_1769481795.usdz
             ],
           ),
         ),
