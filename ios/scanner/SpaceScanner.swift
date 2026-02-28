@@ -4,14 +4,14 @@ import SwiftUI
 import SceneKit
 import ModelIO
 import MetalKit
+import CoreImage // 用于图像处理
 
-// MARK: - 使用 RealityKit 的现代化扫描方案
+// MARK: - 使用 ARSCNView 的现代化扫描方案 (SceneKit)
 
 @available(iOS 13.0, *)
-final class SpaceScannerViewModel: NSObject, ObservableObject {
-    private var arView: ARView!
+final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate {
+    private var sceneView: ARSCNView!
     private var meshAnchors: [UUID: ARAnchor] = [:]
-    private var lastFrame: ARFrame?
     
     override init() {
         super.init()
@@ -19,20 +19,15 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
     }
     
     private func setupARView() {
-        arView = ARView(frame: .zero)
-        arView.session.delegate = self
+        sceneView = ARSCNView(frame: .zero)
+        sceneView.delegate = self
         
-        // 启用网格可视化（显示扫描的网格）
-        if #available(iOS 13.4, *) {
-            arView.debugOptions.insert(.showSceneUnderstanding)
-        }
-        
-        // 启用环境光遮蔽等效果
-        arView.environment.sceneUnderstanding.options = [.occlusion, .receivesLighting]
+        // 自动光照
+        sceneView.autoenablesDefaultLighting = true
     }
     
-    func getARView() -> ARView {
-        return arView
+    func getSceneView() -> ARSCNView {
+        return sceneView
     }
     
     func startScanning() {
@@ -45,29 +40,106 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
         config.sceneReconstruction = .mesh
         config.environmentTexturing = .automatic
         
-        // 启用平面检测（有助于提高质量）
+        // 启用平面检测
         config.planeDetection = [.horizontal, .vertical]
         
-        // 启用场景深度（如果支持）
+        // 启用场景深度
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
         
-        arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         
-        // 启用场景理解网格显示
-        if #available(iOS 13.4, *) {
-            arView.debugOptions.insert(.showSceneUnderstanding)
+        print("✅ 开始扫描（使用 ARSCNView）")
+    }
+    
+    // MARK: - ARSCNViewDelegate (可视化网格)
+    
+    func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
+        guard let meshAnchor = anchor as? ARMeshAnchor else { return nil }
+        
+        // 创建用于可视化的简化几何体（不带颜色，高性能）
+        let geometry = createVisualizationGeometry(from: meshAnchor.geometry)
+        
+        let node = SCNNode(geometry: geometry)
+        
+        // 设置统一的材质颜色
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor.white.withAlphaComponent(0.6) // 半透明白色
+        material.lightingModel = .physicallyBased
+        material.isDoubleSided = true // 确保双面可见
+        
+        // 可选：添加线框效果让结构更清晰
+        // material.fillMode = .lines 
+        
+        geometry.materials = [material]
+        
+        return node
+    }
+    
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        guard let meshAnchor = anchor as? ARMeshAnchor else { return }
+        
+        // 更新几何体
+        // 直接创建新的 SCNGeometry 并替换
+        // 这是一个高效的操作，因为 buffer 是共享的 Metal buffer
+        let newGeometry = createVisualizationGeometry(from: meshAnchor.geometry)
+        
+        // 保持原来的材质
+        let materials = node.geometry?.materials ?? []
+        newGeometry.materials = materials
+        
+        // 如果没有材质（首次 update？），则重新创建
+        if newGeometry.materials.isEmpty {
+            let material = SCNMaterial()
+            material.diffuse.contents = UIColor.white.withAlphaComponent(0.6)
+            material.lightingModel = .physicallyBased
+            material.isDoubleSided = true
+            newGeometry.materials = [material]
         }
         
-        print("✅ 开始扫描（网格可视化已启用）")
+        node.geometry = newGeometry
+    }
+    
+    // 创建轻量级可视化几何体 (仅顶点和索引)
+    private func createVisualizationGeometry(from mesh: ARMeshGeometry) -> SCNGeometry {
+        let vertices = mesh.vertices
+        
+        let vertexSource = SCNGeometrySource(buffer: vertices.buffer,
+                                             vertexFormat: vertices.format,
+                                             semantic: .vertex,
+                                             vertexCount: vertices.count,
+                                             dataOffset: vertices.offset,
+                                             dataStride: vertices.stride)
+        
+        let normals = mesh.normals
+        let normalSource = SCNGeometrySource(buffer: normals.buffer,
+                                             vertexFormat: normals.format,
+                                             semantic: .normal,
+                                             vertexCount: normals.count,
+                                             dataOffset: normals.offset,
+                                             dataStride: normals.stride)
+        
+        let faces = mesh.faces
+        let facesData = Data(bytes: faces.buffer.contents(), count: faces.buffer.length)
+        
+        let element = SCNGeometryElement(data: facesData,
+                                         primitiveType: .triangles,
+                                         primitiveCount: faces.count,
+                                         bytesPerIndex: faces.bytesPerIndex)
+        
+        return SCNGeometry(sources: [vertexSource, normalSource], elements: [element])
     }
     
     func stopScanningAndExport() -> URL? {
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let fileURL = documentsURL.appendingPathComponent("scan_\(Date().timeIntervalSince1970).usdz")
+        // 改为 .usdc 格式，MDLAsset 可以直接导出，且兼容 iOS 查看
+        let fileURL = documentsURL.appendingPathComponent("scan_\(Date().timeIntervalSince1970).usdc")
         
-        arView.session.pause()
+        // 获取当前帧用于颜色采样
+        let currentFrame = sceneView.session.currentFrame
+        
+        sceneView.session.pause()
         
         print("📋 准备导出场景")
         
@@ -75,7 +147,7 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 // 使用 RealityKit 导出场景
-                try self.exportSceneToUSDZ(to: fileURL)
+                try self.exportSceneToUSDZ(to: fileURL, frame: currentFrame)
                 
                 DispatchQueue.main.async {
                     ObjectScannerPlugin.pendingResult?([
@@ -97,12 +169,12 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
         return fileURL
     }
     
-    private func exportSceneToUSDZ(to url: URL) throws {
+    private func exportSceneToUSDZ(to url: URL, frame: ARFrame?) throws {
         if #available(iOS 14.0, *) {
             print("📊 开始导出场景...")
             
             // 获取所有网格锚点
-            let allAnchors = arView.session.currentFrame?.anchors ?? []
+            let allAnchors = sceneView.session.currentFrame?.anchors ?? []
             let meshAnchors = allAnchors.compactMap { $0 as? ARMeshAnchor }
             
             guard !meshAnchors.isEmpty else {
@@ -120,15 +192,26 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
             var totalVertices = 0
             var totalFaces = 0
             
-            // 获取最后一帧用于纹理
-            let textureFrame = lastFrame
+            // 准备纹理图像
             var textureImage: UIImage?
+            var cameraTransform: simd_float4x4?
+            var cameraIntrinsics: simd_float3x3?
+            var imageResolution: CGSize = .zero
             
-            if let frame = textureFrame {
-                textureImage = createTextureImage(from: frame)
-                print("📷 纹理图像已创建: \(textureImage?.size.width ?? 0) x \(textureImage?.size.height ?? 0)")
-            } else {
-                print("⚠️ 没有相机帧，将使用默认颜色")
+            if let frame = frame {
+                // 将 CVPixelBuffer 转换为 UIImage 用于纹理
+                let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
+                let context = CIContext()
+                if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
+                    textureImage = UIImage(cgImage: cgImage)
+                }
+                
+                cameraTransform = frame.camera.transform
+                cameraIntrinsics = frame.camera.intrinsics
+                imageResolution = CGSize(
+                    width: CVPixelBufferGetWidth(frame.capturedImage),
+                    height: CVPixelBufferGetHeight(frame.capturedImage)
+                )
             }
             
             // 为每个网格创建 SCNNode
@@ -140,33 +223,42 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
                 totalVertices += vertexCount
                 totalFaces += faceCount
                 
-                print("🔨 处理网格: \(vertexCount) 顶点, \(faceCount) 面")
+                // 创建 SCNGeometry（带 UV 坐标）
+                let geometry = createSCNGeometry(
+                    from: meshAnchor, 
+                    cameraTransform: cameraTransform,
+                    cameraIntrinsics: cameraIntrinsics,
+                    imageResolution: imageResolution
+                )
                 
-                // 创建 SCNGeometry（带UV坐标）
-                let geometry = createSCNGeometry(from: meshAnchor, frame: textureFrame)
-                
-                // 创建材质（使用纹理）
+                // 创建材质
                 let material = SCNMaterial()
-                material.lightingModel = .physicallyBased
+                material.lightingModel = .physicallyBased 
                 material.isDoubleSided = true
                 
+                // 设置纹理
                 if let texture = textureImage {
                     material.diffuse.contents = texture
                 } else {
-                    material.diffuse.contents = UIColor(white: 0.8, alpha: 1.0)
+                    material.diffuse.contents = UIColor.lightGray
                 }
+                
+                // 设置材质属性
                 material.metalness.contents = 0.0
-                material.roughness.contents = 0.5
+                material.roughness.contents = 1.0 
                 
-                geometry.materials = [material]
+                // 关键修正：将材质直接赋值给 SCNNode 而不是 SCNGeometry
+                // 有时候 SceneKit/ModelIO 导出时，Geometry 级别的材质可能会被忽略或处理不当
+                // 或者确保 Geometry 的 materials 数组被正确设置
+                geometry.materials = [material] 
                 
-                // 创建节点（变换已经应用到顶点，所以节点使用单位矩阵）
+                // 创建节点
                 let node = SCNNode(geometry: geometry)
                 node.name = "Mesh_\(meshAnchor.identifier.uuidString.prefix(8))"
-                // 不再设置 transform，因为顶点已经是世界坐标
-                rootNode.addChildNode(node)
+                // 确保节点也持有该材质（双重保险）
+                node.geometry?.materials = [material]
                 
-                print("  ✓ 添加到场景")
+                rootNode.addChildNode(node)
             }
             
             scene.rootNode.addChildNode(rootNode)
@@ -190,13 +282,27 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
             // 删除已存在的文件
             try? FileManager.default.removeItem(at: url)
             
-            // 使用 SceneKit 导出 USDZ
-            do {
-                try scene.write(to: url, options: nil, delegate: nil, progressHandler: nil)
-                
+            // 使用 ModelIO 导出 USDC (支持纹理)
+            let mdlAsset = MDLAsset(scnScene: scene)
+            
+            // 关键：确保 ModelIO 知道要打包纹理
+            // 有时直接 export 可能会丢失 external textures
+            // 这里我们尝试将 texture 写入文件系统，然后让 MDLAsset 引用它
+            // 或者使用 SceneKit 的 write(to:options:)
+            
+            // 尝试使用 SceneKit 直接导出，SceneKit 对 USDZ 的支持可能比 MDLAsset 的默认导出更完整
+            // 特别是内嵌纹理
+             do {
+                // SCNScene 的 write 方法在处理内嵌纹理方面通常更可靠
+                // .checkConsistency = true 可以帮我们发现问题
+                 let success = scene.write(to: url, options: [:], delegate: nil, progressHandler: nil)
+                 if !success {
+                     throw NSError(domain: "SpaceScanner", code: 5, userInfo: [NSLocalizedDescriptionKey: "SceneKit write failed"])
+                 }
+                 
                 // 验证文件
                 let fileExists = FileManager.default.fileExists(atPath: url.path)
-                print("✅ 导出完成")
+                print("✅ SceneKit 导出完成")
                 print("   文件路径: \(url.path)")
                 print("   文件存在: \(fileExists)")
                 
@@ -228,92 +334,86 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
     }
     
     @available(iOS 14.0, *)
-    private func createSCNGeometry(from meshAnchor: ARMeshAnchor, frame: ARFrame?) -> SCNGeometry {
+    private func createSCNGeometry(
+        from meshAnchor: ARMeshAnchor,
+        cameraTransform: simd_float4x4?,
+        cameraIntrinsics: simd_float3x3?,
+        imageResolution: CGSize
+    ) -> SCNGeometry {
         let mesh = meshAnchor.geometry
         let transform = meshAnchor.transform
         
-        // 手动复制顶点数据（应用变换）
         let vertexCount = mesh.vertices.count
         let vertexBuffer = mesh.vertices.buffer
         let vertexOffset = mesh.vertices.offset
         let vertexStride = mesh.vertices.stride
         
         var transformedVertices: [SCNVector3] = []
-        var texcoords: [SIMD2<Float>] = []
+        var transformedNormals: [SCNVector3] = []
+        var textureCoordinates: [CGPoint] = [] // 改用纹理坐标
+        var indices: [UInt32] = []
+        
+        // 预分配内存
         transformedVertices.reserveCapacity(vertexCount)
-        texcoords.reserveCapacity(vertexCount)
+        transformedNormals.reserveCapacity(vertexCount)
+        textureCoordinates.reserveCapacity(vertexCount)
         
+        // 1. 处理顶点和 UV 坐标
         let basePointer = vertexBuffer.contents().advanced(by: vertexOffset)
-        
-        // 获取相机参数用于UV计算
-        var cameraTransform: simd_float4x4?
-        var cameraIntrinsics: simd_float3x3?
-        var imageWidth: Float = 1920
-        var imageHeight: Float = 1440
-        
-        if let frame = frame {
-            cameraTransform = frame.camera.transform
-            cameraIntrinsics = frame.camera.intrinsics
-            imageWidth = Float(CVPixelBufferGetWidth(frame.capturedImage))
-            imageHeight = Float(CVPixelBufferGetHeight(frame.capturedImage))
-        }
         
         for i in 0..<vertexCount {
             let vertexPointer = basePointer.advanced(by: i * vertexStride)
             let vertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
             
-            // 应用变换矩阵，将局部坐标转换为世界坐标
+            // 变换到世界坐标
             let worldVertex = transform * SIMD4<Float>(vertex, 1.0)
             let worldPos = SIMD3<Float>(worldVertex.x, worldVertex.y, worldVertex.z)
             transformedVertices.append(SCNVector3(worldPos.x, worldPos.y, worldPos.z))
             
-            // 计算UV坐标
-            var uv = SIMD2<Float>(0.5, 0.5) // 默认中心
+            // 计算纹理坐标 (UV)
+            var uv = CGPoint.zero
             
             if let camTransform = cameraTransform,
                let camIntrinsics = cameraIntrinsics {
-                // 将世界坐标转换为相机坐标
+                
+                // 世界坐标 -> 相机坐标
                 let cameraSpacePoint = simd_mul(simd_inverse(camTransform), SIMD4<Float>(worldPos, 1.0))
                 
-                // 如果点在相机前方
-                if cameraSpacePoint.z > 0 {
-                    let x = cameraSpacePoint.x / cameraSpacePoint.z
-                    let y = cameraSpacePoint.y / cameraSpacePoint.z
+                // 点必须在相机前方 (Z < 0)
+                if cameraSpacePoint.z < 0 {
+                    // 投影到归一化图像平面
+                    let z = -cameraSpacePoint.z
+                    let x = cameraSpacePoint.x / z
+                    let y = cameraSpacePoint.y / z
                     
+                    // 应用相机内参矩阵投影到像素坐标
                     let fx = camIntrinsics[0][0]
                     let fy = camIntrinsics[1][1]
                     let cx = camIntrinsics[2][0]
                     let cy = camIntrinsics[2][1]
                     
-                    let pixelX = fx * x + cx
-                    let pixelY = fy * y + cy
+                    let pixelX = x * fx + cx
+                    let pixelY = y * fy + cy
                     
-                    // 转换为UV坐标 [0, 1]
-                    let u = pixelX / imageWidth
-                    let v = pixelY / imageHeight
+                    // 归一化到 [0, 1] 范围作为 UV
+                    // 注意：Metal/SceneKit 的纹理坐标系 (0,0) 通常在左下角，而图像像素 (0,0) 在左上角
+                    // 需要反转 Y 轴: 1.0 - (pixelY / height)
+                    let u = CGFloat(pixelX) / imageResolution.width
+                    let v = 1.0 - (CGFloat(pixelY) / imageResolution.height)
                     
-                    uv = SIMD2<Float>(
-                        max(0, min(1, u)),
-                        max(0, min(1, v))
-                    )
+                    uv = CGPoint(x: u, y: v)
                 }
             }
-            
-            texcoords.append(uv)
+            textureCoordinates.append(uv)
         }
         
-        // 手动复制法线数据（应用旋转）
+        // 2. 处理法线
         let normalCount = mesh.normals.count
         let normalBuffer = mesh.normals.buffer
         let normalOffset = mesh.normals.offset
         let normalStride = mesh.normals.stride
-        
-        var transformedNormals: [SCNVector3] = []
-        transformedNormals.reserveCapacity(normalCount)
-        
         let normalBasePointer = normalBuffer.contents().advanced(by: normalOffset)
         
-        // 提取旋转矩阵（3x3）
         let rotation = simd_float3x3(
             SIMD3<Float>(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z),
             SIMD3<Float>(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z),
@@ -323,144 +423,33 @@ final class SpaceScannerViewModel: NSObject, ObservableObject {
         for i in 0..<normalCount {
             let normalPointer = normalBasePointer.advanced(by: i * normalStride)
             let normal = normalPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            
-            // 只应用旋转到法线
             let worldNormal = rotation * normal
             transformedNormals.append(SCNVector3(worldNormal.x, worldNormal.y, worldNormal.z))
         }
         
-        // 手动复制面索引数据
+        // 3. 处理索引
         let facesCount = mesh.faces.count
         let facesBuffer = mesh.faces.buffer
         let bytesPerIndex = mesh.faces.bytesPerIndex
-        
-        var indices: [UInt32] = []
-        indices.reserveCapacity(facesCount * 3)
-        
         let facesBasePointer = facesBuffer.contents()
         
+        indices.reserveCapacity(facesCount * 3)
         if bytesPerIndex == 2 {
-            let uint16Pointer = facesBasePointer.assumingMemoryBound(to: UInt16.self)
-            for i in 0..<(facesCount * 3) {
-                indices.append(UInt32(uint16Pointer[i]))
-            }
+            let p = facesBasePointer.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<(facesCount * 3) { indices.append(UInt32(p[i])) }
         } else {
-            let uint32Pointer = facesBasePointer.assumingMemoryBound(to: UInt32.self)
-            for i in 0..<(facesCount * 3) {
-                indices.append(uint32Pointer[i])
-            }
+            let p = facesBasePointer.assumingMemoryBound(to: UInt32.self)
+            for i in 0..<(facesCount * 3) { indices.append(p[i]) }
         }
         
-        // 创建顶点源
-        let vertexData = Data(bytes: transformedVertices, count: transformedVertices.count * MemoryLayout<SCNVector3>.stride)
-        let vertexSource = SCNGeometrySource(
-            data: vertexData,
-            semantic: .vertex,
-            vectorCount: vertexCount,
-            usesFloatComponents: true,
-            componentsPerVector: 3,
-            bytesPerComponent: MemoryLayout<Float>.size,
-            dataOffset: 0,
-            dataStride: MemoryLayout<SCNVector3>.stride
-        )
+        // 4. 构建 SCNGeometrySource
+        let vertexSource = SCNGeometrySource(vertices: transformedVertices)
+        let normalSource = SCNGeometrySource(normals: transformedNormals)
+        let texcoordSource = SCNGeometrySource(textureCoordinates: textureCoordinates) // 新增 UV Source
         
-        // 创建法线源
-        let normalData = Data(bytes: transformedNormals, count: transformedNormals.count * MemoryLayout<SCNVector3>.stride)
-        let normalSource = SCNGeometrySource(
-            data: normalData,
-            semantic: .normal,
-            vectorCount: normalCount,
-            usesFloatComponents: true,
-            componentsPerVector: 3,
-            bytesPerComponent: MemoryLayout<Float>.size,
-            dataOffset: 0,
-            dataStride: MemoryLayout<SCNVector3>.stride
-        )
-        
-        // 创建UV坐标源
-        let texcoordData = Data(bytes: texcoords, count: texcoords.count * MemoryLayout<SIMD2<Float>>.stride)
-        let texcoordSource = SCNGeometrySource(
-            data: texcoordData,
-            semantic: .texcoord,
-            vectorCount: vertexCount,
-            usesFloatComponents: true,
-            componentsPerVector: 2,
-            bytesPerComponent: MemoryLayout<Float>.size,
-            dataOffset: 0,
-            dataStride: MemoryLayout<SIMD2<Float>>.stride
-        )
-        
-        // 创建几何元素
-        let indexData = Data(bytes: indices, count: indices.count * MemoryLayout<UInt32>.stride)
-        let element = SCNGeometryElement(
-            data: indexData,
-            primitiveType: .triangles,
-            primitiveCount: facesCount,
-            bytesPerIndex: MemoryLayout<UInt32>.size
-        )
+        let element = SCNGeometryElement(indices: indices, primitiveType: .triangles)
         
         return SCNGeometry(sources: [vertexSource, normalSource, texcoordSource], elements: [element])
-    }
-    
-    // 从 ARFrame 创建纹理图像
-    private func createTextureImage(from frame: ARFrame) -> UIImage? {
-        let pixelBuffer = frame.capturedImage
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext(options: nil)
-        
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
-            return nil
-        }
-        
-        // 旋转图像以匹配设备方向
-        return UIImage(cgImage: cgImage, scale: 1.0, orientation: .right)
-    }
-    
-}
-
-// MARK: - ARSessionDelegate
-
-@available(iOS 13.0, *)
-extension SpaceScannerViewModel: ARSessionDelegate {
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // 保存最新帧用于颜色提取
-        lastFrame = frame
-    }
-    
-    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-        if #available(iOS 14.0, *) {
-            for anchor in anchors {
-                if let meshAnchor = anchor as? ARMeshAnchor {
-                    let mesh = meshAnchor.geometry
-                    print("✅ 添加网格: \(mesh.vertices.count) 顶点, \(mesh.faces.count) 面")
-                    meshAnchors[anchor.identifier] = anchor
-                }
-            }
-            
-            if meshAnchors.count % 5 == 0 && !meshAnchors.isEmpty {
-                print("📊 当前已捕获 \(meshAnchors.count) 个网格")
-            }
-        }
-    }
-    
-    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        if #available(iOS 14.0, *) {
-            for anchor in anchors {
-                if anchor is ARMeshAnchor {
-                    meshAnchors[anchor.identifier] = anchor
-                }
-            }
-        }
-    }
-    
-    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-        if #available(iOS 14.0, *) {
-            for anchor in anchors {
-                if anchor is ARMeshAnchor {
-                    meshAnchors.removeValue(forKey: anchor.identifier)
-                }
-            }
-        }
     }
 }
 
@@ -473,7 +462,7 @@ struct SpaceScanView: View {
     
     var body: some View {
         ZStack(alignment: .bottom) {
-            ARViewContainer(arView: viewModel.getARView())
+            ARViewContainer(sceneView: viewModel.getSceneView())
                 .ignoresSafeArea()
                 .onAppear {
                     viewModel.startScanning()
@@ -508,11 +497,11 @@ struct SpaceScanView: View {
 
 @available(iOS 14.0, *)
 struct ARViewContainer: UIViewRepresentable {
-    let arView: ARView
+    let sceneView: ARSCNView
     
-    func makeUIView(context: Context) -> ARView {
-        return arView
+    func makeUIView(context: Context) -> ARSCNView {
+        return sceneView
     }
     
-    func updateUIView(_ uiView: ARView, context: Context) {}
+    func updateUIView(_ uiView: ARSCNView, context: Context) {}
 }
