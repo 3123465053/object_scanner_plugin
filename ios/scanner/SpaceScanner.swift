@@ -11,7 +11,7 @@ import CoreImage // 用于图像处理
 @available(iOS 13.0, *)
 final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate {
     private var sceneView: ARSCNView!
-    private var meshAnchors: [UUID: ARAnchor] = [:]
+    private var meshAnchors: [UUID: ARMeshAnchor] = [:]
     
     override init() {
         super.init()
@@ -36,6 +36,9 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
             return
         }
         
+        // 清空之前的锚点
+        meshAnchors.removeAll()
+        
         let config = ARWorldTrackingConfiguration()
         config.sceneReconstruction = .mesh
         config.environmentTexturing = .automatic
@@ -58,6 +61,9 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
     func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
         guard let meshAnchor = anchor as? ARMeshAnchor else { return nil }
         
+        // 记录 anchor
+        meshAnchors[meshAnchor.identifier] = meshAnchor
+        
         // 创建用于可视化的简化几何体（不带颜色，高性能）
         let geometry = createVisualizationGeometry(from: meshAnchor.geometry)
         
@@ -76,11 +82,18 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         
         return node
     }
+
+        
+
     
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
         guard let meshAnchor = anchor as? ARMeshAnchor else { return }
         
+        // 更新 anchor 状态
+        meshAnchors[meshAnchor.identifier] = meshAnchor
+        
         // 更新几何体
+        // 直接创建新的 SCNGeometry 并替换
         // 直接创建新的 SCNGeometry 并替换
         // 这是一个高效的操作，因为 buffer 是共享的 Metal buffer
         let newGeometry = createVisualizationGeometry(from: meshAnchor.geometry)
@@ -101,6 +114,15 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         node.geometry = newGeometry
     }
     
+    func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
+        if let meshAnchor = anchor as? ARMeshAnchor {
+            // 不要移除已经扫描到的网格，即使用户移动视角导致其不可见
+            // 我们希望保留所有数据用于导出
+            // meshAnchors.removeValue(forKey: meshAnchor.identifier)
+            print("⚠️ 系统尝试移除网格: \(meshAnchor.identifier)，已拦截保留")
+        }
+    }
+
     // 创建轻量级可视化几何体 (仅顶点和索引)
     private func createVisualizationGeometry(from mesh: ARMeshGeometry) -> SCNGeometry {
         let vertices = mesh.vertices
@@ -136,18 +158,26 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         // 改为 .usdc 格式，MDLAsset 可以直接导出，且兼容 iOS 查看
         let fileURL = documentsURL.appendingPathComponent("scan_\(Date().timeIntervalSince1970).usdc")
         
-        // 获取当前帧用于颜色采样
-        let currentFrame = sceneView.session.currentFrame
+        // 1. 在主线程立即捕获所有状态
+        guard let currentFrame = sceneView.session.currentFrame else {
+            print("❌ 无法获取当前帧")
+            return nil
+        }
+        
+        // 关键修复：直接使用自己维护的 meshAnchors 列表
+        // ARFrame.anchors 可能不完整或被剔除，但我们希望导出所有扫描过的区域
+        // 并过滤掉那些已经被系统标记为 remove 的（已经通过 didRemove 处理）
+        let anchors = Array(self.meshAnchors.values)
         
         sceneView.session.pause()
         
-        print("📋 准备导出场景")
+        print("📋 准备导出场景，共捕获 \(anchors.count) 个网格块")
         
-        // 在后台导出
+        // 2. 在后台导出 (传入捕获到的锚点列表)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 // 使用 RealityKit 导出场景
-                try self.exportSceneToUSDZ(to: fileURL, frame: currentFrame)
+                try self.exportSceneToUSDZ(to: fileURL, anchors: anchors, frame: currentFrame)
                 
                 DispatchQueue.main.async {
                     ObjectScannerPlugin.pendingResult?([
@@ -169,20 +199,14 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         return fileURL
     }
     
-    private func exportSceneToUSDZ(to url: URL, frame: ARFrame?) throws {
+    private func exportSceneToUSDZ(to url: URL, anchors: [ARMeshAnchor], frame: ARFrame) throws {
         if #available(iOS 14.0, *) {
             print("📊 开始导出场景...")
             
-            // 获取所有网格锚点
-            let allAnchors = sceneView.session.currentFrame?.anchors ?? []
-            let meshAnchors = allAnchors.compactMap { $0 as? ARMeshAnchor }
-            
-            guard !meshAnchors.isEmpty else {
+            guard !anchors.isEmpty else {
                 throw NSError(domain: "SpaceScanner", code: 1, 
                             userInfo: [NSLocalizedDescriptionKey: "没有捕获到网格数据，请确保设备支持LiDAR并移动设备扫描物体"])
             }
-            
-            print("📦 找到 \(meshAnchors.count) 个网格锚点")
             
             // 使用 SceneKit 创建场景
             let scene = SCNScene()
@@ -198,24 +222,22 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
             var cameraIntrinsics: simd_float3x3?
             var imageResolution: CGSize = .zero
             
-            if let frame = frame {
-                // 将 CVPixelBuffer 转换为 UIImage 用于纹理
-                let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
-                let context = CIContext()
-                if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
-                    textureImage = UIImage(cgImage: cgImage)
-                }
-                
-                cameraTransform = frame.camera.transform
-                cameraIntrinsics = frame.camera.intrinsics
-                imageResolution = CGSize(
-                    width: CVPixelBufferGetWidth(frame.capturedImage),
-                    height: CVPixelBufferGetHeight(frame.capturedImage)
-                )
+            // 处理纹理数据
+            let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
+            let context = CIContext()
+            if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
+                textureImage = UIImage(cgImage: cgImage)
             }
             
+            cameraTransform = frame.camera.transform
+            cameraIntrinsics = frame.camera.intrinsics
+            imageResolution = CGSize(
+                width: CVPixelBufferGetWidth(frame.capturedImage),
+                height: CVPixelBufferGetHeight(frame.capturedImage)
+            )
+            
             // 为每个网格创建 SCNNode
-            for meshAnchor in meshAnchors {
+            for meshAnchor in anchors {
                 let mesh = meshAnchor.geometry
                 let vertexCount = mesh.vertices.count
                 let faceCount = mesh.faces.count
