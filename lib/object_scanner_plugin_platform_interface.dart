@@ -40,4 +40,8 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('startScannerSpace has not been implemented.');
   }
 
+  openUSDZ(String path) {
+    throw UnimplementedError('openUSDZ has not been implemented.');
+  }
+
 }

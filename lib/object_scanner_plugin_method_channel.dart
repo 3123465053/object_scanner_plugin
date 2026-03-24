@@ -36,4 +36,11 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
     var res = await  methodChannel.invokeMethod("startScannerSpace");
     return res;
   }
+
+  //预览USDZ文件
+  @override
+  openUSDZ(String path) async {
+    var res = await methodChannel.invokeMethod("openUSDZ", {"path": path});
+    return res;
+  }
 }

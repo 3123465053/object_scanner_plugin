@@ -16,9 +16,14 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.startScannerRoom();
   }
 
-  //扫描房间
+  //扫描空间
   startScannerSpace() {
     return ObjectScannerPluginPlatform.instance.startScannerSpace();
+  }
+
+  //预览USDZ文件
+  openUSDZ(String path) {
+    return ObjectScannerPluginPlatform.instance.openUSDZ(path);
   }
 
 }
