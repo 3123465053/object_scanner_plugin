@@ -46,7 +46,11 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
 
   /// 格式转换
   /// inputPath: 输入文件路径
-  /// outputFormat: 目标格式 ("obj", "stl", "ply", "usd", "usda", "usdc")
+  /// outputFormat: 目标格式
+  ///   ModelIO:  obj, stl, ply, usd, usda, usdc, abc
+  ///   SceneKit: usdz, dae, scn
+  ///   自定义:    glb, gltf
+  /// inputPath: 支持 usdz/usd/obj/stl/ply/abc/fbx 等 ModelIO 可读取的格式
   convertFormat(String inputPath, String outputFormat) {
     throw UnimplementedError('convertFormat has not been implemented.');
   }

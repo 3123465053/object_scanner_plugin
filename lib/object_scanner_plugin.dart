@@ -27,7 +27,15 @@ class ObjectScannerPlugin {
   }
 
   //格式转换
-  //outputFormat: "obj", "stl", "ply", "usd", "usda", "usdc"
+  // outputFormat 支持的输出格式:
+  //   obj, stl, ply, usd, usda, usdc, abc  -- 通过 ModelIO
+  //   usdz, dae, scn                        -- 通过 SceneKit
+  //   glb, gltf                             -- 自定义 GLTF 2.0 导出器
+  //
+  // inputPath 支持的输入格式 (ModelIO 可读取):
+  //   usdz, usd, obj, stl, ply, abc, fbx 等
+  //
+  // 不支持的格式: stp, igs, x_t, 3dxml, 3mf, jt, ifc, solidworks (无 iOS 原生 API)
   convertFormat(String inputPath, String outputFormat) {
     return ObjectScannerPluginPlatform.instance.convertFormat(inputPath, outputFormat);
   }
