@@ -26,4 +26,10 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.openUSDZ(path);
   }
 
+  //格式转换
+  //outputFormat: "obj", "stl", "ply", "usd", "usda", "usdc"
+  convertFormat(String inputPath, String outputFormat) {
+    return ObjectScannerPluginPlatform.instance.convertFormat(inputPath, outputFormat);
+  }
+
 }

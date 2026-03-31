@@ -44,4 +44,11 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('openUSDZ has not been implemented.');
   }
 
+  /// 格式转换
+  /// inputPath: 输入文件路径
+  /// outputFormat: 目标格式 ("obj", "stl", "ply", "usd", "usda", "usdc")
+  convertFormat(String inputPath, String outputFormat) {
+    throw UnimplementedError('convertFormat has not been implemented.');
+  }
+
 }

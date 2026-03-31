@@ -43,4 +43,14 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
     var res = await methodChannel.invokeMethod("openUSDZ", {"path": path});
     return res;
   }
+
+  //格式转换
+  @override
+  convertFormat(String inputPath, String outputFormat) async {
+    var res = await methodChannel.invokeMethod("convertFormat", {
+      "inputPath": inputPath,
+      "outputFormat": outputFormat,
+    });
+    return res;
+  }
 }

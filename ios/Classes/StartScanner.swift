@@ -90,6 +90,11 @@ struct StartScanner{
         }
     }
     
+    //格式转换
+    static func convertFormat(result: @escaping FlutterResult, inputPath: String, outputFormat: String){
+        FormatConverter.convert(inputPath: inputPath, outputFormat: outputFormat, result: result)
+    }
+
     //打开USDZ文件
     static func openUSDZ(result: @escaping FlutterResult,path:String){
         

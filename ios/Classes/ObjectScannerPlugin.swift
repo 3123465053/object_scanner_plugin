@@ -46,6 +46,15 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin {
            }
         StartScanner.openUSDZ(result: result, path: path)
            result(nil)
+    case "convertFormat":
+           guard let args = call.arguments as? [String: Any],
+                 let inputPath = args["inputPath"] as? String,
+                 let outputFormat = args["outputFormat"] as? String
+                 else {
+               result(FlutterError(code: "INVALID_ARGS", message: "inputPath and outputFormat are required", details: nil))
+               return
+           }
+        StartScanner.convertFormat(result: result, inputPath: inputPath, outputFormat: outputFormat)
     default:
       result(FlutterMethodNotImplemented)
     }
