@@ -103,7 +103,8 @@ struct FormatConverter {
         guard MDLAsset.canExportFileExtension(format) else {
             return false
         }
-        return asset.export(to: outputURL)
+        try (asset as MDLAsset).export(to: outputURL)
+        return true
     }
 
     // MARK: - SceneKit 转换 (usdz / dae / scn)
