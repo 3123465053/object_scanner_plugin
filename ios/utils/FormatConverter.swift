@@ -8,14 +8,13 @@ import Foundation
 import ModelIO
 import SceneKit
 import Flutter
-import ObjectiveC
+import CoreImage
 
 struct FormatConverter {
 
     static let supportedFormats = [
         "obj", "stl", "ply", "usd", "usda", "usdc",
-        "usdz", "dae", "scn",
-        "abc",
+        "usdz", "scn",
         "glb", "gltf"
     ]
 
@@ -25,7 +24,7 @@ struct FormatConverter {
         let format = outputFormat.lowercased()
 
         guard supportedFormats.contains(format) else {
-            result(["path": nil, "msg": "不支持的输出格式: \(outputFormat)"] as [String: Any?])
+            result(["path": nil, "msg": "不支持的输出格式: \(outputFormat)。支持: \(supportedFormats.joined(separator: ", "))"] as [String: Any?])
             return
         }
         guard FileManager.default.fileExists(atPath: inputPath) else {
@@ -36,6 +35,7 @@ struct FormatConverter {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let inputURL = URL(fileURLWithPath: inputPath)
+                let inputExt = inputURL.pathExtension.lowercased()
                 let fileName = inputURL.deletingPathExtension().lastPathComponent
                 let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
                 let outputURL = documentsDir.appendingPathComponent("\(fileName)_converted.\(format)")
@@ -45,24 +45,27 @@ struct FormatConverter {
                 }
 
                 let scene = try loadScene(from: inputURL)
-                let meshes = collectMeshData(from: scene.rootNode)
-                guard !meshes.isEmpty else {
-                    throw convError("输入文件中没有有效的 3D 几何数据")
-                }
 
                 let success: Bool
                 switch format {
-                case "glb":  success = try writeGLTF(meshes: meshes, to: outputURL, binary: true)
-                case "gltf": success = try writeGLTF(meshes: meshes, to: outputURL, binary: false)
-                case "obj":  success = try writeOBJ(meshes: meshes, to: outputURL)
-                case "ply":  success = try writePLY(meshes: meshes, to: outputURL)
-                case "stl":  success = try writeSTL(meshes: meshes, to: outputURL)
-                // SceneKit 直接写：usdz, dae, scn
-                case "usdz", "dae", "scn":
+                // SceneKit 原生写入（保留材质纹理，之前验证可用）
+                case "usdz", "usdc", "usda", "usd", "scn":
                     success = scene.write(to: outputURL, options: nil, delegate: nil, progressHandler: nil)
-                // USD 系列和 ABC：通过中间 USDC 文件 → MDLAsset 导出
-                case "usd", "usda", "usdc", "abc":
-                    success = try exportViaIntermediate(scene: scene, to: outputURL, format: format)
+
+                // GLB/GLTF 自定义导出器
+                case "glb", "gltf":
+                    let meshes = collectMeshData(from: scene.rootNode)
+                    guard !meshes.isEmpty else { throw convError("无有效几何数据") }
+                    success = try writeGLTF(meshes: meshes, to: outputURL, binary: format == "glb")
+
+                // OBJ/STL：先写临时 USDZ（保留纹理）→ 再用 MDLAsset 导出
+                case "obj", "stl":
+                    success = try convertViaTempUSDZ(scene: scene, outputURL: outputURL, format: format)
+
+                // PLY：自定义导出（MDLAsset 不导出顶点颜色，需手动从纹理烘焙）
+                case "ply":
+                    success = try writePLY(scene: scene, to: outputURL)
+
                 default:
                     success = false
                 }
@@ -80,6 +83,35 @@ struct FormatConverter {
         }
     }
 
+    // MARK: - 通过临时 USDZ 中转导出
+
+    /// SCNScene → 临时 USDZ（内嵌纹理）→ MDLAsset.export 到目标格式
+    private static func convertViaTempUSDZ(scene: SCNScene, outputURL: URL, format: String) throws -> Bool {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("temp_\(UUID().uuidString).usdz")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        // 步骤1: SCNScene → USDZ（SceneKit 会将纹理打包进 USDZ）
+        guard scene.write(to: tempURL, options: nil, delegate: nil, progressHandler: nil) else {
+            throw convError("无法创建临时 USDZ")
+        }
+
+        // 步骤2: 从 USDZ 加载 MDLAsset（纹理完整保留）
+        let asset = MDLAsset(url: tempURL)
+        asset.loadTextures()
+
+        guard MDLAsset.canExportFileExtension(format) else {
+            throw convError("不支持导出 \(format) 格式")
+        }
+
+        // 步骤3: MDLAsset 导出到目标格式
+        try asset.export(to: outputURL)
+
+        let attrs = try? FileManager.default.attributesOfItem(atPath: outputURL.path)
+        let size = attrs?[.size] as? Int64 ?? 0
+        return size > 0
+    }
+
     // MARK: - 输入加载
 
     private static func loadScene(from url: URL) throws -> SCNScene {
@@ -89,8 +121,6 @@ struct FormatConverter {
             return try GLTFLoader.loadScene(from: url)
         case "scn":
             return try SCNScene(url: url, options: nil)
-        case "dae":
-            return try SCNScene(url: url, options: [.checkConsistency: true])
         default:
             let asset = MDLAsset(url: url)
             asset.loadTextures()
@@ -98,23 +128,191 @@ struct FormatConverter {
         }
     }
 
-    // MARK: - 几何数据收集
+    // MARK: - PLY 自定义导出器（从纹理烘焙顶点颜色）
+
+    /// 遍历 SCNScene 所有网格，从纹理+UV 烘焙顶点颜色，输出 binary PLY
+    private static func writePLY(scene: SCNScene, to url: URL) throws -> Bool {
+        var allPos: [Float] = []
+        var allNorm: [Float] = []
+        var allColor: [UInt8] = []  // RGB per vertex (3 bytes)
+        var allIdx: [UInt32] = []
+        var vertexOffset: UInt32 = 0
+
+        func processNode(_ node: SCNNode) {
+            guard let geo = node.geometry else {
+                node.childNodes.forEach { processNode($0) }
+                return
+            }
+
+            var positions: [Float] = []
+            var normals: [Float] = []
+            var texCoords: [Float] = []
+            var colors: [Float] = []
+            var indices: [UInt32] = []
+
+            if let s = geo.sources(for: .vertex).first   { extractFloats(s, 3, &positions) }
+            if let s = geo.sources(for: .normal).first    { extractFloats(s, 3, &normals) }
+            if let s = geo.sources(for: .texcoord).first  { extractFloats(s, 2, &texCoords) }
+            if let s = geo.sources(for: .color).first     { extractFloats(s, 4, &colors) }
+            for e in geo.elements { extractIndices(e, 0, &indices) }
+
+            let vtxCount = positions.count / 3
+            guard vtxCount > 0, !indices.isEmpty else {
+                node.childNodes.forEach { processNode($0) }
+                return
+            }
+
+            allPos.append(contentsOf: positions)
+            allNorm.append(contentsOf: normals)
+
+            // 顶点颜色来源优先级: 已有顶点颜色 > 纹理烘焙 > 材质颜色 > 默认灰
+            if colors.count / 4 == vtxCount {
+                // 已有顶点颜色（float → UInt8）
+                for i in 0..<vtxCount {
+                    allColor.append(UInt8(clamping: Int(colors[i*4] * 255)))
+                    allColor.append(UInt8(clamping: Int(colors[i*4+1] * 255)))
+                    allColor.append(UInt8(clamping: Int(colors[i*4+2] * 255)))
+                }
+            } else if let mat = geo.firstMaterial,
+                      let texture = extractImage(from: mat.diffuse.contents),
+                      !texCoords.isEmpty,
+                      let (pixels, tw, th) = textureToRGBA(texture) {
+                // 从纹理+UV 烘焙
+                for i in 0..<vtxCount {
+                    let uvIdx = i * 2
+                    if uvIdx + 1 < texCoords.count {
+                        let u = max(0, min(1, texCoords[uvIdx]))
+                        let v = max(0, min(1, texCoords[uvIdx + 1]))
+                        let px = min(Int(u * Float(tw - 1)), tw - 1)
+                        let py = min(Int(v * Float(th - 1)), th - 1)
+                        let off = (py * tw + px) * 4
+                        allColor.append(pixels[off])     // R
+                        allColor.append(pixels[off + 1]) // G
+                        allColor.append(pixels[off + 2]) // B
+                    } else {
+                        allColor.append(contentsOf: [180, 180, 180])
+                    }
+                }
+            } else if let mat = geo.firstMaterial, let c = mat.diffuse.contents as? UIColor {
+                // 纯色材质
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                c.getRed(&r, green: &g, blue: &b, alpha: &a)
+                let rb = UInt8(clamping: Int(r * 255))
+                let gb = UInt8(clamping: Int(g * 255))
+                let bb = UInt8(clamping: Int(b * 255))
+                for _ in 0..<vtxCount {
+                    allColor.append(contentsOf: [rb, gb, bb])
+                }
+            } else {
+                // 默认灰色
+                for _ in 0..<vtxCount {
+                    allColor.append(contentsOf: [180, 180, 180])
+                }
+            }
+
+            for idx in indices { allIdx.append(idx + vertexOffset) }
+            vertexOffset += UInt32(vtxCount)
+
+            node.childNodes.forEach { processNode($0) }
+        }
+        processNode(scene.rootNode)
+
+        let totalVerts = allPos.count / 3
+        let totalFaces = allIdx.count / 3
+        guard totalVerts > 0 else { return false }
+        let hasNormals = allNorm.count / 3 == totalVerts
+
+        // 写 binary PLY
+        var header = "ply\nformat binary_little_endian 1.0\n"
+        header += "element vertex \(totalVerts)\n"
+        header += "property float x\nproperty float y\nproperty float z\n"
+        if hasNormals { header += "property float nx\nproperty float ny\nproperty float nz\n" }
+        header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        header += "element face \(totalFaces)\n"
+        header += "property list uchar int vertex_indices\n"
+        header += "end_header\n"
+
+        var data = Data()
+        data.append(header.data(using: .ascii)!)
+
+        for i in 0..<totalVerts {
+            var x = allPos[i*3], y = allPos[i*3+1], z = allPos[i*3+2]
+            data.append(Data(bytes: &x, count: 4))
+            data.append(Data(bytes: &y, count: 4))
+            data.append(Data(bytes: &z, count: 4))
+            if hasNormals {
+                var nx = allNorm[i*3], ny = allNorm[i*3+1], nz = allNorm[i*3+2]
+                data.append(Data(bytes: &nx, count: 4))
+                data.append(Data(bytes: &ny, count: 4))
+                data.append(Data(bytes: &nz, count: 4))
+            }
+            data.append(contentsOf: [allColor[i*3], allColor[i*3+1], allColor[i*3+2]])
+        }
+        for i in 0..<totalFaces {
+            var count: UInt8 = 3
+            var i0 = Int32(allIdx[i*3]), i1 = Int32(allIdx[i*3+1]), i2 = Int32(allIdx[i*3+2])
+            data.append(Data(bytes: &count, count: 1))
+            data.append(Data(bytes: &i0, count: 4))
+            data.append(Data(bytes: &i1, count: 4))
+            data.append(Data(bytes: &i2, count: 4))
+        }
+
+        try data.write(to: url)
+        return true
+    }
+
+    /// CGContext 渲染到已知格式的像素缓冲区（iOS 原生 BGRA，格式保证正确）
+    /// 亮度差异由预览端 shader modifier 修正，这里只负责提取正确的 RGB 值
+    private static func textureToRGBA(_ image: UIImage) -> (pixels: [UInt8], width: Int, height: Int)? {
+        guard let cgImage = image.cgImage else { return nil }
+        let w = cgImage.width
+        let h = cgImage.height
+        guard w > 0, h > 0 else { return nil }
+
+        let bytesPerRow = w * 4
+        var bgraData = [UInt8](repeating: 0, count: h * bytesPerRow)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+
+        // iOS 原生格式: byteOrder32Little + noneSkipFirst = BGRX（无预乘）
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue
+        guard let ctx = CGContext(
+            data: &bgraData, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+            space: colorSpace, bitmapInfo: bitmapInfo
+        ) else { return nil }
+
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        // BGRX → RGBA：B在offset+0, G在offset+1, R在offset+2, X在offset+3
+        var rgbaData = [UInt8](repeating: 0, count: w * h * 4)
+        for i in 0..<(w * h) {
+            let s = i * 4
+            rgbaData[s]     = bgraData[s + 2] // R
+            rgbaData[s + 1] = bgraData[s + 1] // G
+            rgbaData[s + 2] = bgraData[s]     // B
+            rgbaData[s + 3] = 255
+        }
+
+        return (rgbaData, w, h)
+    }
+
+    // MARK: - GLB / GLTF 自定义导出器（内嵌纹理）
 
     struct MeshData {
-        var positions:  [Float] = []   // xyz
-        var normals:    [Float] = []   // xyz
-        var texCoords:  [Float] = []   // uv
-        var colors:     [Float] = []   // rgba (顶点颜色)
+        var positions:  [Float] = []
+        var normals:    [Float] = []
+        var texCoords:  [Float] = []
+        var colors:     [Float] = []
         var indices:    [UInt32] = []
         var diffuseR: Float = 0.7
         var diffuseG: Float = 0.7
         var diffuseB: Float = 0.7
         var metallic:  Float = 0.0
         var roughness: Float = 0.5
+        var diffuseTexture: UIImage? = nil
         var vertexCount: Int { positions.count / 3 }
     }
 
-    /// 遍历 SCNScene 所有节点，提取几何数据 + 材质颜色 + 顶点颜色
     private static func collectMeshData(from root: SCNNode) -> [MeshData] {
         var result: [MeshData] = []
 
@@ -127,24 +325,13 @@ struct FormatConverter {
                 if let s = geo.sources(for: .color).first     { extractFloats(s, 4, &m.colors) }
                 for e in geo.elements { extractIndices(e, 0, &m.indices) }
 
-                // 材质
                 if let mat = geo.firstMaterial {
-                    // diffuse 可能是 UIColor 或 UIImage
-                    if let c = mat.diffuse.contents as? UIColor {
+                    if let img = extractImage(from: mat.diffuse.contents) {
+                        m.diffuseTexture = img
+                    } else if let c = mat.diffuse.contents as? UIColor {
                         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
                         c.getRed(&r, green: &g, blue: &b, alpha: &a)
                         m.diffuseR = Float(r); m.diffuseG = Float(g); m.diffuseB = Float(b)
-                    } else if mat.diffuse.contents is UIImage {
-                        // 有纹理贴图但无法直接导出为颜色值
-                        // 如果没有顶点颜色，尝试从纹理 + UV 烘焙顶点颜色
-                        if m.colors.isEmpty && !m.texCoords.isEmpty {
-                            m.colors = bakeVertexColorsFromTexture(
-                                texture: mat.diffuse.contents as! UIImage,
-                                texCoords: m.texCoords,
-                                vertexCount: m.vertexCount
-                            )
-                        }
-                        // 保持默认灰色作为 diffuse 基色
                     }
                     if let v = mat.metalness.contents as? NSNumber { m.metallic = v.floatValue }
                     if let v = mat.roughness.contents as? NSNumber { m.roughness = v.floatValue }
@@ -158,300 +345,31 @@ struct FormatConverter {
         return result
     }
 
-    /// 从纹理贴图 + UV 坐标烘焙出顶点颜色
-    private static func bakeVertexColorsFromTexture(texture: UIImage, texCoords: [Float], vertexCount: Int) -> [Float] {
-        guard let cgImage = texture.cgImage else { return [] }
+    private static func extractImage(from contents: Any?) -> UIImage? {
+        guard let contents = contents else { return nil }
 
-        let width = cgImage.width
-        let height = cgImage.height
-        guard width > 0, height > 0 else { return [] }
-
-        // 将图像渲染到 RGBA 像素缓冲区
-        let bytesPerPixel = 4
-        let bytesPerRow = bytesPerPixel * width
-        var pixelData = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
-
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                  data: &pixelData,
-                  width: width,
-                  height: height,
-                  bitsPerComponent: 8,
-                  bytesPerRow: bytesPerRow,
-                  space: colorSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else { return [] }
-
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        // 对每个顶点，根据 UV 坐标采样纹理颜色
-        var colors: [Float] = []
-        colors.reserveCapacity(vertexCount * 4)
-
-        for i in 0..<vertexCount {
-            let uvIdx = i * 2
-            guard uvIdx + 1 < texCoords.count else {
-                colors.append(contentsOf: [0.7, 0.7, 0.7, 1.0])
-                continue
-            }
-
-            var u = texCoords[uvIdx]
-            var v = texCoords[uvIdx + 1]
-
-            // clamp UV to [0, 1]
-            u = max(0, min(1, u))
-            v = max(0, min(1, v))
-
-            // UV → 像素坐标 (V 轴翻转: GLTF/SceneKit UV 原点在左下)
-            let px = min(Int(u * Float(width - 1)), width - 1)
-            let py = min(Int((1.0 - v) * Float(height - 1)), height - 1)
-
-            let offset = (py * width + px) * bytesPerPixel
-            let r = Float(pixelData[offset]) / 255.0
-            let g = Float(pixelData[offset + 1]) / 255.0
-            let b = Float(pixelData[offset + 2]) / 255.0
-            let a = Float(pixelData[offset + 3]) / 255.0
-
-            // 处理预乘 alpha
-            if a > 0.001 {
-                colors.append(contentsOf: [r / a, g / a, b / a, a])
-            } else {
-                colors.append(contentsOf: [r, g, b, a])
+        if let img = contents as? UIImage { return img }
+        if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
+            return UIImage(cgImage: contents as! CGImage)
+        }
+        if let mdlTex = contents as? MDLTexture,
+           let cgImg = mdlTex.imageFromTexture()?.takeUnretainedValue() {
+            return UIImage(cgImage: cgImg)
+        }
+        if let path = contents as? String {
+            if let img = UIImage(contentsOfFile: path) { return img }
+        }
+        if let url = contents as? URL, let data = try? Data(contentsOf: url) {
+            return UIImage(data: data)
+        }
+        if let ciImg = contents as? CIImage {
+            let ctx = CIContext()
+            if let cgImg = ctx.createCGImage(ciImg, from: ciImg.extent) {
+                return UIImage(cgImage: cgImg)
             }
         }
-
-        return colors
+        return nil
     }
-
-    // MARK: - 自定义 OBJ 导出器（带 .mtl 材质文件）
-
-    private static func writeOBJ(meshes: [MeshData], to url: URL) throws -> Bool {
-        let mtlName = url.deletingPathExtension().lastPathComponent + ".mtl"
-        let mtlURL  = url.deletingLastPathComponent().appendingPathComponent(mtlName)
-
-        var obj = "# ObjectScannerPlugin OBJ Export\nmtllib \(mtlName)\n\n"
-        var mtl = "# ObjectScannerPlugin MTL Export\n\n"
-
-        var vOff = 0, vnOff = 0, vtOff = 0
-
-        for (i, m) in meshes.enumerated() {
-            let matName = "material_\(i)"
-
-            // MTL
-            mtl += "newmtl \(matName)\n"
-            mtl += "Ka 0.1 0.1 0.1\n"
-            mtl += String(format: "Kd %.4f %.4f %.4f\n", m.diffuseR, m.diffuseG, m.diffuseB)
-            mtl += "Ks 0.2 0.2 0.2\n"
-            mtl += "Ns 50.0\nd 1.0\nillum 2\n\n"
-
-            // OBJ
-            obj += "o mesh_\(i)\nusemtl \(matName)\n"
-
-            for v in 0..<m.vertexCount {
-                let hasColor = m.colors.count / 4 > v
-                if hasColor {
-                    // OBJ 扩展：v x y z r g b
-                    obj += String(format: "v %.6f %.6f %.6f %.4f %.4f %.4f\n",
-                                  m.positions[v*3], m.positions[v*3+1], m.positions[v*3+2],
-                                  m.colors[v*4], m.colors[v*4+1], m.colors[v*4+2])
-                } else {
-                    obj += String(format: "v %.6f %.6f %.6f\n",
-                                  m.positions[v*3], m.positions[v*3+1], m.positions[v*3+2])
-                }
-            }
-            let normCount = m.normals.count / 3
-            for v in 0..<normCount {
-                obj += String(format: "vn %.6f %.6f %.6f\n",
-                              m.normals[v*3], m.normals[v*3+1], m.normals[v*3+2])
-            }
-            let uvCount = m.texCoords.count / 2
-            for v in 0..<uvCount {
-                obj += String(format: "vt %.6f %.6f\n",
-                              m.texCoords[v*2], m.texCoords[v*2+1])
-            }
-
-            let hasN = normCount > 0
-            let hasT = uvCount > 0
-            let triCount = m.indices.count / 3
-            for t in 0..<triCount {
-                let a = Int(m.indices[t*3])
-                let b = Int(m.indices[t*3+1])
-                let c = Int(m.indices[t*3+2])
-                let va = a + vOff + 1, vb = b + vOff + 1, vc = c + vOff + 1 // 1-indexed
-                if hasT && hasN {
-                    let ta = a + vtOff + 1, tb = b + vtOff + 1, tc = c + vtOff + 1
-                    let na = a + vnOff + 1, nb = b + vnOff + 1, nc = c + vnOff + 1
-                    obj += "f \(va)/\(ta)/\(na) \(vb)/\(tb)/\(nb) \(vc)/\(tc)/\(nc)\n"
-                } else if hasN {
-                    let na = a + vnOff + 1, nb = b + vnOff + 1, nc = c + vnOff + 1
-                    obj += "f \(va)//\(na) \(vb)//\(nb) \(vc)//\(nc)\n"
-                } else {
-                    obj += "f \(va) \(vb) \(vc)\n"
-                }
-            }
-            obj += "\n"
-            vOff += m.vertexCount; vnOff += normCount; vtOff += uvCount
-        }
-
-        try obj.write(to: url, atomically: true, encoding: .utf8)
-        try mtl.write(to: mtlURL, atomically: true, encoding: .utf8)
-        return true
-    }
-
-    // MARK: - 自定义 PLY 导出器（带顶点颜色）
-
-    private static func writePLY(meshes: [MeshData], to url: URL) throws -> Bool {
-        var allPos: [Float] = [], allNorm: [Float] = [], allColor: [Float] = []
-        var allIdx: [UInt32] = []
-        var vertexOffset: UInt32 = 0
-
-        for m in meshes {
-            allPos.append(contentsOf: m.positions)
-            allNorm.append(contentsOf: m.normals)
-
-            // 顶点颜色：优先用顶点颜色，否则用材质 diffuse 色填充
-            if m.colors.count / 4 == m.vertexCount {
-                allColor.append(contentsOf: m.colors)
-            } else {
-                for _ in 0..<m.vertexCount {
-                    allColor.append(contentsOf: [m.diffuseR, m.diffuseG, m.diffuseB, 1.0])
-                }
-            }
-
-            for idx in m.indices { allIdx.append(idx + vertexOffset) }
-            vertexOffset += UInt32(m.vertexCount)
-        }
-
-        let totalVerts = allPos.count / 3
-        let totalFaces = allIdx.count / 3
-        let hasNormals = allNorm.count / 3 == totalVerts
-
-        var header = "ply\nformat ascii 1.0\n"
-        header += "element vertex \(totalVerts)\n"
-        header += "property float x\nproperty float y\nproperty float z\n"
-        if hasNormals {
-            header += "property float nx\nproperty float ny\nproperty float nz\n"
-        }
-        header += "property uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\n"
-        header += "element face \(totalFaces)\n"
-        header += "property list uchar int vertex_indices\n"
-        header += "end_header\n"
-
-        var body = ""
-        for i in 0..<totalVerts {
-            let x = allPos[i*3], y = allPos[i*3+1], z = allPos[i*3+2]
-            body += String(format: "%.6f %.6f %.6f", x, y, z)
-            if hasNormals {
-                body += String(format: " %.6f %.6f %.6f", allNorm[i*3], allNorm[i*3+1], allNorm[i*3+2])
-            }
-            let r = UInt8(clamping: Int(allColor[i*4] * 255))
-            let g = UInt8(clamping: Int(allColor[i*4+1] * 255))
-            let b = UInt8(clamping: Int(allColor[i*4+2] * 255))
-            let a = UInt8(clamping: Int(allColor[i*4+3] * 255))
-            body += " \(r) \(g) \(b) \(a)\n"
-        }
-        for i in 0..<totalFaces {
-            body += "3 \(allIdx[i*3]) \(allIdx[i*3+1]) \(allIdx[i*3+2])\n"
-        }
-
-        try (header + body).write(to: url, atomically: true, encoding: .utf8)
-        return true
-    }
-
-    // MARK: - 自定义 STL 导出器（二进制 STL，无颜色）
-
-    private static func writeSTL(meshes: [MeshData], to url: URL) throws -> Bool {
-        var totalTriangles: UInt32 = 0
-        for m in meshes { totalTriangles += UInt32(m.indices.count / 3) }
-
-        var data = Data(count: 80) // 80 byte header (zeros)
-        var triCount = totalTriangles
-        data.append(Data(bytes: &triCount, count: 4))
-
-        for m in meshes {
-            let triN = m.indices.count / 3
-            let hasNorms = m.normals.count / 3 == m.vertexCount
-            for t in 0..<triN {
-                let i0 = Int(m.indices[t*3])
-                let i1 = Int(m.indices[t*3+1])
-                let i2 = Int(m.indices[t*3+2])
-
-                var nx: Float = 0, ny: Float = 0, nz: Float = 1
-                if hasNorms {
-                    nx = m.normals[i0*3]; ny = m.normals[i0*3+1]; nz = m.normals[i0*3+2]
-                }
-                data.append(floatBytes(nx)); data.append(floatBytes(ny)); data.append(floatBytes(nz))
-
-                for idx in [i0, i1, i2] {
-                    data.append(floatBytes(m.positions[idx*3]))
-                    data.append(floatBytes(m.positions[idx*3+1]))
-                    data.append(floatBytes(m.positions[idx*3+2]))
-                }
-                var attrByteCount: UInt16 = 0
-                data.append(Data(bytes: &attrByteCount, count: 2))
-            }
-        }
-
-        try data.write(to: url)
-        return true
-    }
-
-    private static func floatBytes(_ v: Float) -> Data {
-        var val = v
-        return Data(bytes: &val, count: 4)
-    }
-
-    // MARK: - ModelIO 导出 (abc / usd 等) — 通过中间 USDC 文件
-
-    /// 先用 SceneKit 写出临时 USDC，再用 MDLAsset 加载并导出目标格式
-    /// 这样避免了 MDLAsset(scnScene:) 对程序化 SCNScene 的兼容性问题
-    private static func exportViaIntermediate(scene: SCNScene, to url: URL, format: String) throws -> Bool {
-        // 如果目标就是 usd/usda/usdc，直接用 SceneKit 写
-        if ["usd", "usda", "usdc"].contains(format) {
-            return scene.write(to: url, options: nil, delegate: nil, progressHandler: nil)
-        }
-
-        // ABC 等格式：先写临时 USDC，再转换
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempURL = tempDir.appendingPathComponent("temp_convert_\(UUID().uuidString).usdc")
-        defer { try? FileManager.default.removeItem(at: tempURL) }
-
-        // 步骤1: SCNScene → USDC (SceneKit 原生支持，保留材质和几何)
-        let writeOK = scene.write(to: tempURL, options: nil, delegate: nil, progressHandler: nil)
-        guard writeOK else {
-            throw convError("无法写入临时 USDC 文件")
-        }
-
-        // 步骤2: 从 USDC 加载为 MDLAsset
-        let asset = MDLAsset(url: tempURL)
-        asset.loadTextures()
-
-        // 步骤3: 检查目标格式是否支持导出
-        guard MDLAsset.canExportFileExtension(format) else {
-            // ABC 可能不被 canExportFileExtension 支持，尝试用私有 API
-            return try exportViaPrivateAPI(asset: asset, to: url)
-        }
-
-        try asset.export(to: url)
-        return true
-    }
-
-    /// 使用 ObjC 私有 API 导出 MDLAsset
-    private static func exportViaPrivateAPI(asset: MDLAsset, to url: URL) throws -> Bool {
-        let sel = NSSelectorFromString("exportAssetToURL:error:")
-        typealias ExportFn = @convention(c) (AnyObject, Selector, NSURL, AutoreleasingUnsafeMutablePointer<NSError?>?) -> Bool
-        guard let imp = class_getMethodImplementation(type(of: asset), sel) else {
-            throw convError("MDLAsset exportAssetToURL 不可用，该格式可能不被当前 iOS 版本支持")
-        }
-        let fn = unsafeBitCast(imp, to: ExportFn.self)
-        var error: NSError?
-        let ok = fn(asset, sel, url as NSURL, &error)
-        if let error = error { throw error }
-        if !ok { throw convError("MDLAsset 导出失败") }
-        return true
-    }
-
-    // MARK: - GLTF / GLB 导出器
 
     private static func writeGLTF(meshes: [MeshData], to outputURL: URL, binary: Bool) throws -> Bool {
         var binData = Data()
@@ -460,6 +378,8 @@ struct FormatConverter {
         var gltfMeshes:  [[String: Any]] = []
         var gltfNodes:   [[String: Any]] = []
         var gltfMats:    [[String: Any]] = []
+        var gltfImages:  [[String: Any]] = []
+        var gltfTextures:[[String: Any]] = []
         var nodeIndices: [Int] = []
 
         func appendBuf(_ floats: [Float]) -> (Int, Int) {
@@ -474,8 +394,18 @@ struct FormatConverter {
             while binData.count % 4 != 0 { binData.append(0x00) }
             return (off, binData.count - off)
         }
+        func appendRaw(_ data: Data) -> (Int, Int) {
+            let off = binData.count
+            binData.append(data)
+            while binData.count % 4 != 0 { binData.append(0x00) }
+            return (off, binData.count - off)
+        }
         func addBV(_ off: Int, _ len: Int, _ tgt: Int) -> Int {
             bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": len, "target": tgt])
+            return bufferViews.count - 1
+        }
+        func addBVPlain(_ off: Int, _ len: Int) -> Int {
+            bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": len])
             return bufferViews.count - 1
         }
         func addAC(_ bv: Int, _ ct: Int, _ cnt: Int, _ tp: String, _ extra: [String: Any] = [:]) -> Int {
@@ -487,14 +417,24 @@ struct FormatConverter {
 
         for (i, m) in meshes.enumerated() {
             let matIdx = gltfMats.count
-            gltfMats.append([
-                "pbrMetallicRoughness": [
-                    "baseColorFactor": [m.diffuseR, m.diffuseG, m.diffuseB, 1.0],
-                    "metallicFactor": m.metallic,
-                    "roughnessFactor": m.roughness
-                ] as [String: Any],
-                "doubleSided": true
-            ])
+            var pbrDict: [String: Any] = [
+                "metallicFactor": m.metallic,
+                "roughnessFactor": m.roughness
+            ]
+
+            if let tex = m.diffuseTexture, let pngData = tex.pngData() {
+                let (imgOff, imgLen) = appendRaw(pngData)
+                let imgBV = addBVPlain(imgOff, imgLen)
+                let imgIdx = gltfImages.count
+                gltfImages.append(["bufferView": imgBV, "mimeType": "image/png"])
+                let texIdx = gltfTextures.count
+                gltfTextures.append(["source": imgIdx])
+                pbrDict["baseColorTexture"] = ["index": texIdx]
+            } else {
+                pbrDict["baseColorFactor"] = [m.diffuseR, m.diffuseG, m.diffuseB, 1.0]
+            }
+
+            gltfMats.append(["pbrMetallicRoughness": pbrDict, "doubleSided": true])
 
             let (pO, pL) = appendBuf(m.positions)
             let (minP, maxP) = computeBounds(m.positions)
@@ -529,12 +469,14 @@ struct FormatConverter {
         var bufEntry: [String: Any] = ["byteLength": binData.count]
         if !binary { bufEntry["uri"] = "data:application/octet-stream;base64," + binData.base64EncodedString() }
 
-        let json: [String: Any] = [
+        var json: [String: Any] = [
             "asset": ["version": "2.0", "generator": "ObjectScannerPlugin-iOS"],
             "scene": 0, "scenes": [["nodes": nodeIndices]],
             "nodes": gltfNodes, "meshes": gltfMeshes, "materials": gltfMats,
             "accessors": accessors, "bufferViews": bufferViews, "buffers": [bufEntry]
         ]
+        if !gltfImages.isEmpty { json["images"] = gltfImages }
+        if !gltfTextures.isEmpty { json["textures"] = gltfTextures }
 
         let jsonData = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
         if binary {
@@ -559,8 +501,6 @@ struct FormatConverter {
 
     // MARK: - 工具
 
-    /// 从 SCNGeometrySource 提取浮点分量
-    /// 支持 float32、float64、以及非浮点类型（UInt8/UInt16 归一化到 [0,1]）
     private static func extractFloats(_ src: SCNGeometrySource, _ comps: Int, _ arr: inout [Float]) {
         let data = src.data, count = src.vectorCount, stride = src.dataStride
         let offset = src.dataOffset, bpc = src.bytesPerComponent
@@ -573,17 +513,10 @@ struct FormatConverter {
                         if bpc == 4 { arr.append(ptr.load(fromByteOffset: off, as: Float.self)) }
                         else if bpc == 8 { arr.append(Float(ptr.load(fromByteOffset: off, as: Double.self))) }
                     } else {
-                        // 非浮点分量：UInt8/UInt16 归一化到 [0,1]（常见于顶点颜色）
                         switch bpc {
-                        case 1:
-                            arr.append(Float(ptr.load(fromByteOffset: off, as: UInt8.self)) / 255.0)
-                        case 2:
-                            arr.append(Float(ptr.load(fromByteOffset: off, as: UInt16.self)) / 65535.0)
-                        case 4:
-                            // 可能是 Int32 等，尝试当 Float 读取
-                            arr.append(ptr.load(fromByteOffset: off, as: Float.self))
-                        default:
-                            arr.append(0)
+                        case 1: arr.append(Float(ptr.load(fromByteOffset: off, as: UInt8.self)) / 255.0)
+                        case 2: arr.append(Float(ptr.load(fromByteOffset: off, as: UInt16.self)) / 65535.0)
+                        default: arr.append(0)
                         }
                     }
                 }
