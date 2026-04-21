@@ -53,4 +53,11 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
     });
     return res;
   }
+
+  //导出文件
+  @override
+  exportFile(String path) async {
+    var res = await methodChannel.invokeMethod("exportFile", {"path": path});
+    return res;
+  }
 }

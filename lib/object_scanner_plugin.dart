@@ -40,4 +40,9 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.convertFormat(inputPath, outputFormat);
   }
 
+  //导出文件（调起系统分享面板：保存到文件、AirDrop、微信、邮件等）
+  exportFile(String path) {
+    return ObjectScannerPluginPlatform.instance.exportFile(path);
+  }
+
 }

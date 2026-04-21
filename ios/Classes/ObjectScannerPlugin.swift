@@ -55,6 +55,14 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin {
                return
            }
         StartScanner.convertFormat(result: result, inputPath: inputPath, outputFormat: outputFormat)
+    case "exportFile":
+           guard let args = call.arguments as? [String: Any],
+                 let path = args["path"] as? String
+                 else {
+               result(FlutterError(code: "INVALID_ARGS", message: "path is required", details: nil))
+               return
+           }
+        StartScanner.exportFile(result: result, path: path)
     default:
       result(FlutterMethodNotImplemented)
     }

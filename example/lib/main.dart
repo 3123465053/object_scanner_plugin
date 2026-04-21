@@ -238,6 +238,22 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
     }
   }
 
+  Future<void> _export(String path) async {
+    try {
+      var res = await widget.plugin.exportFile(path);
+      final msg = res?["msg"] ?? "unknown";
+      if (msg == "success") {
+        EasyLoading.showSuccess("导出成功");
+      } else if (msg == "已取消") {
+        // 用户取消无需提示
+      } else {
+        EasyLoading.showError("导出失败: $msg");
+      }
+    } catch (e) {
+      EasyLoading.showError("导出异常: $e");
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -363,10 +379,25 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
                             style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
                         subtitle: Text(r["msg"]!, style: TextStyle(fontSize: 11), maxLines: 2),
                         trailing: hasPath
-                            ? IconButton(
-                                icon: Icon(Icons.visibility, color: Colors.blue, size: 22),
-                                tooltip: "预览",
-                                onPressed: () => _preview(r["path"]!),
+                            ? Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    icon: Icon(Icons.visibility, color: Colors.blue, size: 22),
+                                    tooltip: "预览",
+                                    padding: EdgeInsets.zero,
+                                    constraints: BoxConstraints(),
+                                    onPressed: () => _preview(r["path"]!),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  IconButton(
+                                    icon: Icon(Icons.ios_share, color: Colors.green, size: 22),
+                                    tooltip: "导出",
+                                    padding: EdgeInsets.zero,
+                                    constraints: BoxConstraints(),
+                                    onPressed: () => _export(r["path"]!),
+                                  ),
+                                ],
                               )
                             : null,
                         onTap: hasPath ? () => _preview(r["path"]!) : null,

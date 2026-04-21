@@ -55,4 +55,9 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('convertFormat has not been implemented.');
   }
 
+  /// 导出文件（调起系统分享面板：保存到文件、AirDrop、微信、邮件等）
+  exportFile(String path) {
+    throw UnimplementedError('exportFile has not been implemented.');
+  }
+
 }

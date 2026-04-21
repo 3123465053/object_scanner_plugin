@@ -28,6 +28,21 @@ class MockObjectScannerPluginPlatform
     // TODO: implement startSpaceRoom
     throw UnimplementedError();
   }
+
+  @override
+  openUSDZ(String path) {
+    throw UnimplementedError();
+  }
+
+  @override
+  convertFormat(String inputPath, String outputFormat) {
+    throw UnimplementedError();
+  }
+
+  @override
+  exportFile(String path) {
+    throw UnimplementedError();
+  }
 }
 
 void main() {

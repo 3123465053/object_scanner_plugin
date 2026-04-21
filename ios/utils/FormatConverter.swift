@@ -38,11 +38,15 @@ struct FormatConverter {
                 let inputExt = inputURL.pathExtension.lowercased()
                 let fileName = inputURL.deletingPathExtension().lastPathComponent
                 let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-                let outputURL = documentsDir.appendingPathComponent("\(fileName)_converted.\(format)")
 
-                if FileManager.default.fileExists(atPath: outputURL.path) {
-                    try FileManager.default.removeItem(at: outputURL)
+                // 每种格式独立子目录：避免 obj/mtl、usd/texture 等外挂文件互相覆盖，
+                // 也方便导出时整包打 zip
+                let outputDir = documentsDir.appendingPathComponent("\(fileName)_\(format)")
+                if FileManager.default.fileExists(atPath: outputDir.path) {
+                    try FileManager.default.removeItem(at: outputDir)
                 }
+                try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true, attributes: nil)
+                let outputURL = outputDir.appendingPathComponent("\(fileName).\(format)")
 
                 let scene = try loadScene(from: inputURL)
 
@@ -397,8 +401,11 @@ struct FormatConverter {
         func appendRaw(_ data: Data) -> (Int, Int) {
             let off = binData.count
             binData.append(data)
+            // 返回真实长度（不含后续 4 字节对齐填充）
+            // PNG/JPEG 解码器对 bufferView 末尾的零填充字节敏感，会导致图片读取失败→黑色材质
+            let actualLen = data.count
             while binData.count % 4 != 0 { binData.append(0x00) }
-            return (off, binData.count - off)
+            return (off, actualLen)
         }
         func addBV(_ off: Int, _ len: Int, _ tgt: Int) -> Int {
             bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": len, "target": tgt])
