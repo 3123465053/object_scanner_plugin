@@ -22,71 +22,53 @@ struct StartScanner{
             DispatchQueue.main.async {
                 var res = ViewUtils.presentScanner(rootView: ObjectScannerView())
                 if !res {
-                    ObjectScannerPlugin.pendingResult?([
-                        "path": nil,
-                        "msg": "无法打开扫描界面"
-                    ])
+                    ObjectScannerPlugin.pendingResult?(["path": NSNull(), "msg": "无法打开扫描界面"] as [String: Any])
                     ObjectScannerPlugin.pendingResult = nil
                 }
             }
         } else {
             print("IOS: 当前设备系统版本不支持");
-            result([
-                "path":nil,
-                "msg":"当前设备系统版本不支持"
-            ])
+            result(["path": NSNull(), "msg": "当前设备系统版本不支持"] as [String: Any])
         }
     }
-    
+
     //扫描房间
     static func scannerRoom(result: @escaping FlutterResult){
         if #available(iOS 17.0, *) {
             print("IOS: 开始房间扫描");
-            
+
             // 保存 result，等扫描完成后再回调
             ObjectScannerPlugin.pendingResult = result
             DispatchQueue.main.async {
                 var res = ViewUtils.presentScanner(rootView: RoomScannerView())
                 if !res {
-                    ObjectScannerPlugin.pendingResult?([
-                        "path": nil,
-                        "msg": "无法打开扫描界面"
-                    ])
+                    ObjectScannerPlugin.pendingResult?(["path": NSNull(), "msg": "无法打开扫描界面"] as [String: Any])
                     ObjectScannerPlugin.pendingResult = nil
                 }
             }
         } else {
             print("IOS: 当前设备系统版本不支持");
-            result([
-                "path":nil,
-                "msg":"当前设备系统版本不支持"
-            ])
+            result(["path": NSNull(), "msg": "当前设备系统版本不支持"] as [String: Any])
         }
     }
-    
+
     //空间扫描
     static func scannerSpace(result: @escaping FlutterResult){
         if #available(iOS 17.0, *) {
             print("IOS: 开始空间扫描 (RealityKit)");
-            
+
             // 保存 result，等扫描完成后再回调
             ObjectScannerPlugin.pendingResult = result
             DispatchQueue.main.async {
                 var res = ViewUtils.presentScanner(rootView: SpaceScanView())
                 if !res {
-                    ObjectScannerPlugin.pendingResult?([
-                        "path": nil,
-                        "msg": "无法打开扫描界面"
-                    ])
+                    ObjectScannerPlugin.pendingResult?(["path": NSNull(), "msg": "无法打开扫描界面"] as [String: Any])
                     ObjectScannerPlugin.pendingResult = nil
                 }
             }
         } else {
             print("IOS: 当前设备系统版本不支持");
-            result([
-                "path":nil,
-                "msg":"当前设备系统版本不支持，需要 iOS 14.0+"
-            ])
+            result(["path": NSNull(), "msg": "当前设备系统版本不支持，需要 iOS 14.0+"] as [String: Any])
         }
     }
     
@@ -100,7 +82,7 @@ struct StartScanner{
     //   若所在目录存在 sidecar 文件，会自动打包成 zip 再分享，保证纹理完整
     static func exportFile(result: @escaping FlutterResult, path: String){
         guard FileManager.default.fileExists(atPath: path) else {
-            result(["path": nil, "msg": "文件不存在: \(path)"] as [String: Any?])
+            result(["path": NSNull(), "msg": "文件不存在: \(path)"] as [String: Any])
             return
         }
 
@@ -124,7 +106,7 @@ struct StartScanner{
                     tempZipURL = zipURL
                 } else {
                     DispatchQueue.main.async {
-                        result(["path": nil, "msg": "打包 sidecar 文件失败"] as [String: Any?])
+                        result(["path": NSNull(), "msg": "打包 sidecar 文件失败"] as [String: Any])
                     }
                     return
                 }
@@ -133,7 +115,7 @@ struct StartScanner{
             DispatchQueue.main.async {
                 guard let top = ViewUtils.topViewController() else {
                     if let z = tempZipURL { try? FileManager.default.removeItem(at: z) }
-                    result(["path": nil, "msg": "无法获取当前界面"] as [String: Any?])
+                    result(["path": NSNull(), "msg": "无法获取当前界面"] as [String: Any])
                     return
                 }
 
@@ -149,11 +131,11 @@ struct StartScanner{
                 vc.completionWithItemsHandler = { activityType, completed, _, error in
                     if let z = tempZipURL { try? FileManager.default.removeItem(at: z) }
                     if let error = error {
-                        result(["path": nil, "msg": "导出失败: \(error.localizedDescription)"] as [String: Any?])
+                        result(["path": NSNull(), "msg": "导出失败: \(error.localizedDescription)"] as [String: Any])
                     } else if completed {
-                        result(["path": shareURL.path, "msg": "success"] as [String: Any?])
+                        result(["path": shareURL.path, "msg": "success"] as [String: Any])
                     } else {
-                        result(["path": nil, "msg": "已取消"] as [String: Any?])
+                        result(["path": NSNull(), "msg": "已取消"] as [String: Any])
                     }
                 }
 
@@ -196,19 +178,13 @@ struct StartScanner{
             DispatchQueue.main.async {
                 var res = ViewUtils.presentScanner(rootView: USDZPreview(usdzPath: path))
                 if !res {
-                    ObjectScannerPlugin.pendingResult?([
-                        "path": nil,
-                        "msg": "无法打开预览界面"
-                    ])
+                    ObjectScannerPlugin.pendingResult?(["path": NSNull(), "msg": "无法打开预览界面"] as [String: Any])
                     ObjectScannerPlugin.pendingResult = nil
                 }
             }
         } else {
             print("IOS: 当前设备系统版本不支持");
-            result([
-                "path":nil,
-                "msg":"当前设备系统版本不支持"
-            ])
+            result(["path": NSNull(), "msg": "当前设备系统版本不支持"] as [String: Any])
         }
     }
     

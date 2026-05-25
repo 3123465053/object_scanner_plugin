@@ -24,11 +24,11 @@ struct FormatConverter {
         let format = outputFormat.lowercased()
 
         guard supportedFormats.contains(format) else {
-            result(["path": nil, "msg": "不支持的输出格式: \(outputFormat)。支持: \(supportedFormats.joined(separator: ", "))"] as [String: Any?])
+            result(["path": NSNull(), "msg": "不支持的输出格式: \(outputFormat)。支持: \(supportedFormats.joined(separator: ", "))"] as [String: Any])
             return
         }
         guard FileManager.default.fileExists(atPath: inputPath) else {
-            result(["path": nil, "msg": "输入文件不存在: \(inputPath)"] as [String: Any?])
+            result(["path": NSNull(), "msg": "输入文件不存在: \(inputPath)"] as [String: Any])
             return
         }
 
@@ -75,13 +75,15 @@ struct FormatConverter {
                 }
 
                 DispatchQueue.main.async {
-                    result(success
-                        ? ["path": outputURL.path, "msg": "success"]
-                        : ["path": nil, "msg": "格式转换失败"] as [String: Any?])
+                    if success {
+                        result(["path": outputURL.path, "msg": "success"] as [String: Any])
+                    } else {
+                        result(["path": NSNull(), "msg": "格式转换失败"] as [String: Any])
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    result(["path": nil, "msg": "格式转换异常: \(error.localizedDescription)"] as [String: Any?])
+                    result(["path": NSNull(), "msg": "格式转换异常: \(error.localizedDescription)"] as [String: Any])
                 }
             }
         }
