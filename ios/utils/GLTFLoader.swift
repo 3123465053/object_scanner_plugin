@@ -14,7 +14,8 @@ struct GLTFLoader {
 
     /// 解析 GLB 或 GLTF 文件，返回 SCNScene
     static func loadScene(from url: URL) throws -> SCNScene {
-        let data = try Data(contentsOf: url)
+        // .mappedIfSafe：大文件使用 mmap，避免将整个文件拷贝到堆内存
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         let ext = url.pathExtension.lowercased()
 
         let jsonObj: [String: Any]
@@ -202,24 +203,45 @@ struct GLTFLoader {
         }
     }
 
-    /// 健壮的图像解码：优先 UIImage(data:)，失败则用 ImageIO CGImageSource 兜底
-    /// 可处理大尺寸 WebP（VP8X/带 Alpha）、JPEG、PNG 等格式
-    private static func decodeImage(from data: Data) -> UIImage? {
-        // 快速路径：UIImage 直接解码
-        if let img = UIImage(data: data), img.size.width > 0 {
-            return img
-        }
-        // 兜底路径：使用 ImageIO，减少内存缓存压力，对大尺寸 WebP 更可靠
-        let options: [CFString: Any] = [
+    /// 健壮的图像解码，针对大尺寸纹理进行内存优化：
+    /// - 超过 maxDimension 的图像使用 CGImageSourceCreateThumbnailAtIndex，
+    ///   该 API 直接解码到目标尺寸，**不会**先解码全分辨率图像到内存
+    ///   （4096×4096 WebP → 峰值仅 ~16MB 而非 67MB）
+    /// - 对 VP8X Extended WebP（带 Alpha）比 UIImage(data:) 更可靠
+    private static func decodeImage(from data: Data, maxDimension: Int = 2048) -> UIImage? {
+        let baseOpts: [CFString: Any] = [
             kCGImageSourceShouldCacheImmediately: false,
             kCGImageSourceShouldAllowFloat:       false
         ]
-        guard let src = CGImageSourceCreateWithData(data as CFData, options as CFDictionary),
-              CGImageSourceGetCount(src) > 0,
-              let cgImg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-            return nil
+        guard let src = CGImageSourceCreateWithData(data as CFData, baseOpts as CFDictionary),
+              CGImageSourceGetCount(src) > 0 else {
+            // ImageIO 不支持该格式时回退 UIImage
+            return UIImage(data: data)
         }
-        return UIImage(cgImage: cgImg)
+
+        // 读取原始尺寸，决定是否需要降采样
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        let origW = props?[kCGImagePropertyPixelWidth]  as? Int ?? 0
+        let origH = props?[kCGImagePropertyPixelHeight] as? Int ?? 0
+
+        if max(origW, origH) > maxDimension {
+            // Thumbnail API：内部直接解码到目标尺寸，内存峰值 = 目标尺寸，不经过全分辨率
+            let thumbOpts: [CFString: Any] = [
+                kCGImageSourceThumbnailMaxPixelSize:          maxDimension,
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform:   true,
+                kCGImageSourceShouldCacheImmediately:         false
+            ]
+            if let cgImg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary) {
+                return UIImage(cgImage: cgImg)
+            }
+        }
+
+        // 正常尺寸：直接解码
+        if let cgImg = CGImageSourceCreateImageAtIndex(src, 0, baseOpts as CFDictionary) {
+            return UIImage(cgImage: cgImg)
+        }
+        return UIImage(data: data) // 最终兜底
     }
 
     // MARK: - 材质解析（支持纹理贴图）
