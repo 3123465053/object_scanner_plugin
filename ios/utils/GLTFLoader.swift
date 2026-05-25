@@ -8,6 +8,7 @@
 
 import Foundation
 import SceneKit
+import ImageIO
 
 struct GLTFLoader {
 
@@ -162,14 +163,15 @@ struct GLTFLoader {
     // MARK: - 图像加载（从 GLTF images 数组提取纹理图片）
 
     /// 从 GLTF JSON 的 images 数组中加载所有图像
+    /// 返回 [UIImage?]（保留索引，nil 表示该图像加载失败），避免 compactMap 导致索引错位
     /// 支持: bufferView 引用（GLB 内嵌）、data URI（base64）、外部文件 URI
     private static func loadImages(json: [String: Any],
                                    bufferViews: [[String: Any]],
                                    binData: Data,
-                                   baseURL: URL) -> [UIImage] {
+                                   baseURL: URL) -> [UIImage?] {
         guard let imagesArr = json["images"] as? [[String: Any]] else { return [] }
 
-        return imagesArr.compactMap { imgJson -> UIImage? in
+        return imagesArr.map { imgJson -> UIImage? in
             // 方式1: bufferView 引用（GLB 内嵌图像）
             if let bvIdx = imgJson["bufferView"] as? Int, bvIdx < bufferViews.count {
                 let bv = bufferViews[bvIdx]
@@ -177,7 +179,7 @@ struct GLTFLoader {
                 let length = bv["byteLength"] as? Int ?? 0
                 guard offset + length <= binData.count else { return nil }
                 let imageData = binData.subdata(in: offset..<(offset + length))
-                return UIImage(data: imageData)
+                return decodeImage(from: imageData)
             }
 
             // 方式2: URI
@@ -185,14 +187,14 @@ struct GLTFLoader {
                 // data URI (base64)
                 if uri.hasPrefix("data:"), let range = uri.range(of: ";base64,") {
                     if let data = Data(base64Encoded: String(uri[range.upperBound...])) {
-                        return UIImage(data: data)
+                        return decodeImage(from: data)
                     }
                     return nil
                 }
                 // 外部文件
                 let fileURL = baseURL.appendingPathComponent(uri)
                 if let data = try? Data(contentsOf: fileURL) {
-                    return UIImage(data: data)
+                    return decodeImage(from: data)
                 }
             }
 
@@ -200,9 +202,29 @@ struct GLTFLoader {
         }
     }
 
+    /// 健壮的图像解码：优先 UIImage(data:)，失败则用 ImageIO CGImageSource 兜底
+    /// 可处理大尺寸 WebP（VP8X/带 Alpha）、JPEG、PNG 等格式
+    private static func decodeImage(from data: Data) -> UIImage? {
+        // 快速路径：UIImage 直接解码
+        if let img = UIImage(data: data), img.size.width > 0 {
+            return img
+        }
+        // 兜底路径：使用 ImageIO，减少内存缓存压力，对大尺寸 WebP 更可靠
+        let options: [CFString: Any] = [
+            kCGImageSourceShouldCacheImmediately: false,
+            kCGImageSourceShouldAllowFloat:       false
+        ]
+        guard let src = CGImageSourceCreateWithData(data as CFData, options as CFDictionary),
+              CGImageSourceGetCount(src) > 0,
+              let cgImg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImg)
+    }
+
     // MARK: - 材质解析（支持纹理贴图）
 
-    private static func parseMaterials(_ json: [String: Any], images: [UIImage]) -> [SCNMaterial] {
+    private static func parseMaterials(_ json: [String: Any], images: [UIImage?]) -> [SCNMaterial] {
         guard let mats = json["materials"] as? [[String: Any]] else { return [] }
 
         // 解析 textures 数组：texture → image 的映射
@@ -219,8 +241,9 @@ struct GLTFLoader {
                    let texIdx = baseColorTex["index"] as? Int,
                    texIdx < texturesArr.count,
                    let imgIdx = texturesArr[texIdx]["source"] as? Int,
-                   imgIdx < images.count {
-                    mat.diffuse.contents = images[imgIdx]
+                   imgIdx < images.count,
+                   let image = images[imgIdx] {           // 解包 UIImage?，nil 则跳过
+                    mat.diffuse.contents = image
                     // 如果同时有 baseColorFactor，用作色调调制（乘法混合）
                     // SceneKit 不直接支持乘法混合，但设置 multiply 可以近似
                     if let factor = pbr["baseColorFactor"] as? [NSNumber], factor.count >= 4 {
@@ -246,11 +269,12 @@ struct GLTFLoader {
                    let texIdx = mrTex["index"] as? Int,
                    texIdx < texturesArr.count,
                    let imgIdx = texturesArr[texIdx]["source"] as? Int,
-                   imgIdx < images.count {
+                   imgIdx < images.count,
+                   let image = images[imgIdx] {           // 解包 UIImage?
                     // GLTF: G 通道 = roughness, B 通道 = metallic
                     // SceneKit 不能直接拆分通道，设置到 metalness 贴图
-                    mat.metalness.contents = images[imgIdx]
-                    mat.roughness.contents = images[imgIdx]
+                    mat.metalness.contents = image
+                    mat.roughness.contents = image
                 } else {
                     if let metallic = pbr["metallicFactor"] as? NSNumber {
                         mat.metalness.contents = metallic.floatValue
@@ -266,8 +290,9 @@ struct GLTFLoader {
                let texIdx = normalTex["index"] as? Int,
                texIdx < texturesArr.count,
                let imgIdx = texturesArr[texIdx]["source"] as? Int,
-               imgIdx < images.count {
-                mat.normal.contents = images[imgIdx]
+               imgIdx < images.count,
+               let image = images[imgIdx] {
+                mat.normal.contents = image
             }
 
             // emissive
@@ -275,8 +300,9 @@ struct GLTFLoader {
                let texIdx = emissiveTex["index"] as? Int,
                texIdx < texturesArr.count,
                let imgIdx = texturesArr[texIdx]["source"] as? Int,
-               imgIdx < images.count {
-                mat.emission.contents = images[imgIdx]
+               imgIdx < images.count,
+               let image = images[imgIdx] {
+                mat.emission.contents = image
             } else if let emissive = matJson["emissiveFactor"] as? [NSNumber], emissive.count >= 3 {
                 mat.emission.contents = UIColor(
                     red: CGFloat(emissive[0].floatValue),
@@ -291,8 +317,9 @@ struct GLTFLoader {
                let texIdx = occTex["index"] as? Int,
                texIdx < texturesArr.count,
                let imgIdx = texturesArr[texIdx]["source"] as? Int,
-               imgIdx < images.count {
-                mat.ambientOcclusion.contents = images[imgIdx]
+               imgIdx < images.count,
+               let image = images[imgIdx] {
+                mat.ambientOcclusion.contents = image
             }
 
             return mat

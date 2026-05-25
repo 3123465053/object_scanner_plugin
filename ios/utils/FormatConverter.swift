@@ -431,11 +431,11 @@ struct FormatConverter {
                 "roughnessFactor": m.roughness
             ]
 
-            if let tex = m.diffuseTexture, let pngData = tex.pngData() {
-                let (imgOff, imgLen) = appendRaw(pngData)
+            if let tex = m.diffuseTexture, let (texBytes, mimeType) = encodeTexture(tex) {
+                let (imgOff, imgLen) = appendRaw(texBytes)
                 let imgBV = addBVPlain(imgOff, imgLen)
                 let imgIdx = gltfImages.count
-                gltfImages.append(["bufferView": imgBV, "mimeType": "image/png"])
+                gltfImages.append(["bufferView": imgBV, "mimeType": mimeType])
                 let texIdx = gltfTextures.count
                 gltfTextures.append(["source": imgIdx])
                 pbrDict["baseColorTexture"] = ["index": texIdx]
@@ -565,6 +565,36 @@ struct FormatConverter {
             mxX=Swift.max(mxX,p[i*3]); mxY=Swift.max(mxY,p[i*3+1]); mxZ=Swift.max(mxZ,p[i*3+2])
         }
         return ((mnX,mnY,mnZ),(mxX,mxY,mxZ))
+    }
+
+    /// 将 UIImage 编码为适合嵌入 GLTF 的字节：
+    /// - 无 Alpha 或透明度不重要时优先使用 JPEG（更小、内存压力更低）
+    /// - 有 Alpha 时使用 PNG
+    /// 返回 (Data, mimeType)，编码失败返回 nil
+    private static func encodeTexture(_ image: UIImage) -> (Data, String)? {
+        let hasAlpha: Bool
+        if let cgImg = image.cgImage {
+            let ai = cgImg.alphaInfo
+            hasAlpha = ai != .none && ai != .noneSkipFirst && ai != .noneSkipLast
+        } else {
+            hasAlpha = false
+        }
+
+        if !hasAlpha {
+            // JPEG：对大尺寸贴图内存友好，文件更小
+            if let data = image.jpegData(compressionQuality: 0.92) {
+                return (data, "image/jpeg")
+            }
+        }
+        // 含 Alpha 或 JPEG 编码失败时用 PNG
+        if let data = image.pngData() {
+            return (data, "image/png")
+        }
+        // 最后兜底：降质 JPEG
+        if let data = image.jpegData(compressionQuality: 0.85) {
+            return (data, "image/jpeg")
+        }
+        return nil
     }
 
     private static func convError(_ msg: String) -> NSError {
