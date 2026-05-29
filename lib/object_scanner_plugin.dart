@@ -45,4 +45,36 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.exportFile(path);
   }
 
+  // ── 后台格式转换 ──────────────────────────────────────────────
+
+  /// 后台转换结果流。每条事件为 Map：
+  ///   { 'jobId': String, 'path': String? (null 表示失败), 'msg': String }
+  ///
+  /// 用法：
+  ///   final plugin = ObjectScannerPlugin();
+  ///   plugin.conversionResultStream.listen((event) {
+  ///     if (event['jobId'] == myJobId) {
+  ///       final path = event['path'];  // null → 失败
+  ///       final msg  = event['msg'];
+  ///     }
+  ///   });
+  Stream<Map<String, dynamic>> get conversionResultStream {
+    return ObjectScannerPluginPlatform.instance.conversionResultStream;
+  }
+
+  /// 启动后台格式转换，**立即返回** jobId，不等待转换完成。
+  /// 转换结果通过 [conversionResultStream] 推送。
+  ///
+  /// 示例：
+  ///   final jobId = await plugin.startConvertFormatBg(inputPath, 'obj');
+  ///   // UI 不阻塞，可继续操作
+  ///   plugin.conversionResultStream
+  ///       .where((e) => e['jobId'] == jobId)
+  ///       .first
+  ///       .then((e) => print('完成: ${e['path']}'));
+  Future<String> startConvertFormatBg(String inputPath, String outputFormat) {
+    return ObjectScannerPluginPlatform.instance
+        .startConvertFormatBg(inputPath, outputFormat);
+  }
+
 }

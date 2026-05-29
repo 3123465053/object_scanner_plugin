@@ -12,11 +12,52 @@ import CoreImage
 
 struct FormatConverter {
 
+    // MARK: - Scene 缓存（同一文件多格式转换时只解码一次）
+    // 使用 NSLock 保证线程安全（转换运行在 global queue 上）
+    private static let _lock = NSLock()
+    private static var _cachedURL:   URL?      = nil
+    private static var _cachedScene: SCNScene? = nil
+
+    /// 从缓存取 Scene；缓存未命中时解码并存入缓存
+    private static func cachedScene(for url: URL) throws -> SCNScene {
+        _lock.lock()
+        if _cachedURL == url, let hit = _cachedScene {
+            _lock.unlock()
+            return hit
+        }
+        _lock.unlock()
+
+        // 缓存未命中：重新加载（可能耗时）
+        let fresh = try _loadSceneFresh(from: url)
+
+        _lock.lock()
+        _cachedURL   = url
+        _cachedScene = fresh
+        _lock.unlock()
+
+        return fresh
+    }
+
+    /// 清除 Scene 缓存（切换文件时释放内存）
+    static func clearSceneCache() {
+        _lock.lock()
+        _cachedURL   = nil
+        _cachedScene = nil
+        _lock.unlock()
+    }
+
     static let supportedFormats = [
         "obj", "stl", "ply", "usd", "usda", "usdc",
         "usdz", "scn",
         "glb", "gltf"
     ]
+
+    // 串行转换队列：所有格式转换依次执行，避免并发时内存爆涨、Scene 缓存失效
+    // qos: .userInitiated 保证系统给足 CPU，但同一时刻只跑一个任务
+    private static let conversionQueue = DispatchQueue(
+        label: "com.objectscanner.conversion",
+        qos: .userInitiated
+    )
 
     // MARK: - 主入口
 
@@ -32,7 +73,7 @@ struct FormatConverter {
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        conversionQueue.async {
             do {
                 let inputURL = URL(fileURLWithPath: inputPath)
                 let inputExt = inputURL.pathExtension.lowercased()
@@ -48,7 +89,8 @@ struct FormatConverter {
                 try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true, attributes: nil)
                 let outputURL = outputDir.appendingPathComponent("\(fileName).\(format)")
 
-                let scene = try loadScene(from: inputURL)
+                // 使用缓存：同一文件多格式转换时只解码一次
+                let scene = try cachedScene(for: inputURL)
 
                 let success: Bool
                 switch format {
@@ -62,7 +104,7 @@ struct FormatConverter {
                     guard !meshes.isEmpty else { throw convError("无有效几何数据") }
                     success = try writeGLTF(meshes: meshes, to: outputURL, binary: format == "glb")
 
-                // OBJ：直接从 MeshData 写（绕过 USDZ 中转，修复纹理丢失，更快）
+                // OBJ：直接从 MeshData 写（含纹理），跳过 scene.write() 避免性能瓶颈
                 case "obj":
                     let meshes = collectMeshData(from: scene.rootNode)
                     guard !meshes.isEmpty else { throw convError("无有效几何数据") }
@@ -101,6 +143,42 @@ struct FormatConverter {
 
     /// SCNScene → 临时 USDZ（内嵌纹理）→ MDLAsset.export 到目标格式
     private static func convertViaTempUSDZ(scene: SCNScene, outputURL: URL, format: String) throws -> Bool {
+        // 步骤0: 将内存中的 UIImage 纹理物化为磁盘 JPEG 文件
+        // SceneKit 的 scene.write() 无法序列化内存中的 UIImage 对象，
+        // 只能引用文件路径；若不提前物化，USDZ 里会出现悬空的 texgen_N.png
+        //
+        // 重要：物化前先记录原始 contents，defer 里恢复，
+        // 保证缓存中的 SCNScene 可被后续格式转换复用。
+        let texDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sctex_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: texDir, withIntermediateDirectories: true)
+
+        var texCounter = 0
+        // (material, originalContents) — 用于 defer 恢复
+        var savedContents: [(SCNMaterial, Any?)] = []
+
+        scene.rootNode.enumerateHierarchy { node, _ in
+            for mat in node.geometry?.materials ?? [] {
+                if let img = mat.diffuse.contents as? UIImage,
+                   let data = img.jpegData(compressionQuality: 0.92) {
+                    let fileURL = texDir.appendingPathComponent("diff\(texCounter).jpg")
+                    if (try? data.write(to: fileURL)) != nil {
+                        savedContents.append((mat, img))   // 保存原始 UIImage
+                        mat.diffuse.contents = fileURL     // 物化为文件路径
+                        texCounter += 1
+                    }
+                }
+            }
+        }
+
+        // defer 里无论成功/异常都恢复材质，保证缓存 Scene 状态干净
+        defer {
+            for (mat, original) in savedContents {
+                mat.diffuse.contents = original
+            }
+            try? FileManager.default.removeItem(at: texDir)
+        }
+
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("temp_\(UUID().uuidString).usdz")
         defer { try? FileManager.default.removeItem(at: tempURL) }
@@ -128,7 +206,8 @@ struct FormatConverter {
 
     // MARK: - 输入加载
 
-    private static func loadScene(from url: URL) throws -> SCNScene {
+    /// 真正从磁盘加载（不经过缓存）
+    private static func _loadSceneFresh(from url: URL) throws -> SCNScene {
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "glb", "gltf":
@@ -521,6 +600,7 @@ struct FormatConverter {
     private static func extractFloats(_ src: SCNGeometrySource, _ comps: Int, _ arr: inout [Float]) {
         let data = src.data, count = src.vectorCount, stride = src.dataStride
         let offset = src.dataOffset, bpc = src.bytesPerComponent
+        arr.reserveCapacity(arr.count + count * comps)  // 预留容量，避免百万次追加反复扩容
         data.withUnsafeBytes { ptr in
             for i in 0..<count {
                 for c in 0..<comps {
@@ -591,16 +671,25 @@ struct FormatConverter {
         defer { objHandle.closeFile(); mtlHandle.closeFile() }
 
         // 流式写缓冲（512KB 阈值后刷新，减少 syscall 次数）
-        var objBuf = ""; objBuf.reserveCapacity(524_288)
+        var objBuf = ""; objBuf.reserveCapacity(600_000)
         var mtlBuf = ""; mtlBuf.reserveCapacity(4_096)
 
+        // ★★ 关键：手动跟踪累积字节数。
+        //    绝不能用 objBuf.count！Swift 的 String.count 是 O(n)（遍历 grapheme），
+        //    在数百万次 append 中调用会退化成 O(n²)，直接卡死。
+        var objPending = 0
+
         func flushOBJ() {
-            if let d = objBuf.data(using: .utf8) { objHandle.write(d) }
-            objBuf = ""
+            if !objBuf.isEmpty {
+                objHandle.write(Data(objBuf.utf8))
+                objBuf.removeAll(keepingCapacity: true)  // 保留已分配容量
+                objPending = 0
+            }
         }
         func appendOBJ(_ s: String) {
             objBuf += s
-            if objBuf.count > 524_288 { flushOBJ() }
+            objPending += s.utf8.count                   // 只数刚追加的小串，O(len(s))
+            if objPending > 524_288 { flushOBJ() }
         }
         func appendMTL(_ s: String) { mtlBuf += s }
 
@@ -609,15 +698,29 @@ struct FormatConverter {
 
         var vertexBase = 1  // OBJ 索引从 1 开始
 
+        // 纹理去重：UIImage 是引用类型，ObjectIdentifier 代表实例地址
+        // GLB 的多个子网格往往共享同一个 UIImage 实例；不去重会重复编码 N 次 JPEG
+        var texCache: [ObjectIdentifier: String] = [:]
+        var texFileCount = 0
+
         for (i, m) in meshes.enumerated() {
             let matName = "mat_\(i)"
 
-            // ---- 导出纹理文件 ----
+            // ---- 导出纹理文件（去重：同一 UIImage 实例只写一次）----
             var texFileName: String? = nil
-            if let tex = m.diffuseTexture, let (texData, ext) = encodeTextureForFile(tex) {
-                let fn = "\(baseName)_tex\(i).\(ext)"
-                let texURL = dir.appendingPathComponent(fn)
-                if (try? texData.write(to: texURL)) != nil { texFileName = fn }
+            if let tex = m.diffuseTexture {
+                let key = ObjectIdentifier(tex)
+                if let cached = texCache[key] {
+                    texFileName = cached           // 直接复用，不重复编码
+                } else if let (texData, ext) = encodeTextureForFile(tex) {
+                    let fn = "\(baseName)_tex\(texFileCount).\(ext)"
+                    let texURL = dir.appendingPathComponent(fn)
+                    if (try? texData.write(to: texURL)) != nil {
+                        texFileName = fn
+                        texCache[key] = fn
+                        texFileCount += 1
+                    }
+                }
             }
 
             // ---- MTL ----
@@ -625,16 +728,16 @@ struct FormatConverter {
             if let fn = texFileName {
                 appendMTL("map_Kd \(fn)\nKd 1.000 1.000 1.000\n")
             } else {
-                appendMTL(String(format: "Kd %.4f %.4f %.4f\n", m.diffuseR, m.diffuseG, m.diffuseB))
+                // ★ 用字符串插值替代 String(format:)，避免 printf 开销
+                appendMTL("Kd \(m.diffuseR) \(m.diffuseG) \(m.diffuseB)\n")
             }
             appendMTL("Ks 0.000 0.000 0.000\nillum 2\n\n")
 
-            // ---- 顶点坐标 ----
+            // ---- 顶点坐标（★ 插值代替 String(format:)，百万次调用差异显著）----
             let vc = m.vertexCount
             for vi in 0..<vc {
                 let b = vi * 3
-                appendOBJ(String(format: "v %g %g %g\n",
-                    m.positions[b], m.positions[b+1], m.positions[b+2]))
+                appendOBJ("v \(m.positions[b]) \(m.positions[b+1]) \(m.positions[b+2])\n")
             }
 
             // ---- 纹理坐标 ----
@@ -642,8 +745,7 @@ struct FormatConverter {
             if hasUV {
                 for vi in 0..<vc {
                     let b = vi * 2
-                    appendOBJ(String(format: "vt %g %g\n",
-                        m.texCoords[b], m.texCoords[b+1]))
+                    appendOBJ("vt \(m.texCoords[b]) \(m.texCoords[b+1])\n")
                 }
             }
 
@@ -652,8 +754,7 @@ struct FormatConverter {
             if hasNorm {
                 for vi in 0..<vc {
                     let b = vi * 3
-                    appendOBJ(String(format: "vn %g %g %g\n",
-                        m.normals[b], m.normals[b+1], m.normals[b+2]))
+                    appendOBJ("vn \(m.normals[b]) \(m.normals[b+1]) \(m.normals[b+2])\n")
                 }
             }
 
@@ -733,8 +834,8 @@ struct FormatConverter {
                 // 写 12 个 float32 + 2 字节属性 = 50 字节
                 func wf(_ f: Float) {
                     withUnsafeBytes(of: f.bitPattern.littleEndian) {
-                        buf[off]=   $0[0]; buf[off+1]=$0[1]
-                        buf[off+2]= $0[2]; buf[off+3]=$0[3]
+                        buf[off] = $0[0]; buf[off+1] = $0[1]
+                        buf[off+2] = $0[2]; buf[off+3] = $0[3]
                     }
                     off += 4
                 }

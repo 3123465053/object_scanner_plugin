@@ -60,4 +60,15 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('exportFile has not been implemented.');
   }
 
+  /// 后台格式转换结果流
+  /// 每条事件：{ 'jobId': String, 'path': String?, 'msg': String }
+  Stream<Map<String, dynamic>> get conversionResultStream {
+    throw UnimplementedError('conversionResultStream has not been implemented.');
+  }
+
+  /// 启动后台格式转换，立即返回 jobId；转换结果通过 [conversionResultStream] 推送
+  Future<String> startConvertFormatBg(String inputPath, String outputFormat) {
+    throw UnimplementedError('startConvertFormatBg has not been implemented.');
+  }
+
 }
