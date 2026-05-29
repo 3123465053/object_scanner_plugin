@@ -94,9 +94,11 @@ struct FormatConverter {
 
                 let success: Bool
                 switch format {
-                // SceneKit 原生写入（保留材质纹理，之前验证可用）
+                // SceneKit 原生写入
+                // ★ scene.write() 可能在内部修改 mat.diffuse.contents（UIImage → 内部纹理句柄），
+                //   先保存再还原，确保缓存的 SCNScene 对后续格式仍有效
                 case "usdz", "usdc", "usda", "usd", "scn":
-                    success = scene.write(to: outputURL, options: nil, delegate: nil, progressHandler: nil)
+                    success = sceneWritePreserving(scene: scene, to: outputURL)
 
                 // GLB/GLTF 自定义导出器
                 case "glb", "gltf":
@@ -724,28 +726,29 @@ struct FormatConverter {
             }
 
             // ---- MTL ----
+            // ★ Kd 必须在 map_Kd 之前：MDLAsset 把同一 semantic 的最后一条当最终值，
+            //   若 Kd(white) 写在 map_Kd 之后，会覆盖纹理引用 → 预览全白
             appendMTL("newmtl \(matName)\nKa 1.000 1.000 1.000\n")
             if let fn = texFileName {
-                appendMTL("map_Kd \(fn)\nKd 1.000 1.000 1.000\n")
+                appendMTL("Kd 1.000 1.000 1.000\nmap_Kd \(fn)\n")  // Kd → 再写 map_Kd
             } else {
-                // ★ 用字符串插值替代 String(format:)，避免 printf 开销
                 appendMTL("Kd \(m.diffuseR) \(m.diffuseG) \(m.diffuseB)\n")
             }
             appendMTL("Ks 0.000 0.000 0.000\nillum 2\n\n")
 
-            // ---- 顶点坐标（★ 插值代替 String(format:)，百万次调用差异显著）----
+            // ---- 顶点坐标 ----
             let vc = m.vertexCount
             for vi in 0..<vc {
                 let b = vi * 3
                 appendOBJ("v \(m.positions[b]) \(m.positions[b+1]) \(m.positions[b+2])\n")
             }
 
-            // ---- 纹理坐标 ----
+            // ---- 纹理坐标（★ GLTF V=0 在顶部，OBJ V=0 在底部，需要翻转 V = 1 - v）----
             let hasUV = !m.texCoords.isEmpty
             if hasUV {
                 for vi in 0..<vc {
                     let b = vi * 2
-                    appendOBJ("vt \(m.texCoords[b]) \(m.texCoords[b+1])\n")
+                    appendOBJ("vt \(m.texCoords[b]) \(1.0 - m.texCoords[b+1])\n")
                 }
             }
 
@@ -893,6 +896,27 @@ struct FormatConverter {
             return (data, "image/jpeg")
         }
         return nil
+    }
+
+    /// scene.write() 前保存所有材质的 diffuse.contents，写完后还原。
+    /// SceneKit 在序列化时可能把 UIImage 替换为内部纹理句柄，
+    /// 若不还原，缓存的 SCNScene 在下一次 collectMeshData 时会丢失纹理。
+    @discardableResult
+    private static func sceneWritePreserving(scene: SCNScene, to url: URL) -> Bool {
+        // 保存
+        var saved: [(SCNMaterial, Any?)] = []
+        scene.rootNode.enumerateHierarchy { node, _ in
+            for mat in node.geometry?.materials ?? [] {
+                saved.append((mat, mat.diffuse.contents))
+            }
+        }
+        // 写入
+        let ok = scene.write(to: url, options: nil, delegate: nil, progressHandler: nil)
+        // 还原（无论成功失败）
+        for (mat, original) in saved {
+            mat.diffuse.contents = original
+        }
+        return ok
     }
 
     private static func convError(_ msg: String) -> NSError {
