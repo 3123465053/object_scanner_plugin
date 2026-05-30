@@ -170,29 +170,61 @@ struct StartScanner{
 
     // AR Quick Look 预览
     // 使用 ARQuickLookPreviewItem + QLPreviewController(.fullScreen)
-    // ARQuickLookPreviewItem 会直接以 AR 模式打开（跳过 3D 对象预览页），
-    // .fullScreen 保证不会以底部 sheet 形式弹出。
+    // 非 USDZ 格式先在后台转换为 USDZ，再开启 AR 预览；临时文件关闭后自动删除。
     static func openARQuickLook(result: @escaping FlutterResult, path: String) {
         guard FileManager.default.fileExists(atPath: path) else {
             result(["msg": "文件不存在: \(path)"] as [String: Any])
             return
         }
-        DispatchQueue.main.async {
-            guard let top = ViewUtils.topViewController() else {
-                result(["msg": "无法获取当前界面"] as [String: Any])
-                return
+
+        let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
+
+        if ext == "usdz" {
+            // 已经是 USDZ，直接预览
+            DispatchQueue.main.async {
+                presentARQuickLook(result: result, usdzPath: path, tempPath: nil)
             }
-            let url         = URL(fileURLWithPath: path)
-            let coordinator = ARQLCoordinator(url: url, result: result)
-            let qlVC        = QLPreviewController()
-            qlVC.dataSource = coordinator
-            qlVC.delegate   = coordinator
-            qlVC.modalPresentationStyle = .fullScreen
-            // 持有 coordinator，防止 ARC 提前释放
-            objc_setAssociatedObject(qlVC, &ARQLCoordinator.key,
-                                     coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            top.present(qlVC, animated: true)
+        } else {
+            // 非 USDZ：后台转换，完成后再开启 AR 预览
+            DispatchQueue.global(qos: .userInitiated).async {
+                FormatConverter.convert(inputPath: path, outputFormat: "usdz") { convResult in
+                    let dict    = convResult as? [String: Any] ?? [:]
+                    let msg     = dict["msg"]  as? String ?? ""
+                    let outPath = dict["path"] as? String ?? ""
+
+                    guard msg == "success",
+                          !outPath.isEmpty,
+                          FileManager.default.fileExists(atPath: outPath) else {
+                        DispatchQueue.main.async {
+                            result(["msg": "转换 USDZ 失败: \(msg)"] as [String: Any])
+                        }
+                        return
+                    }
+                    DispatchQueue.main.async {
+                        // tempPath = outPath，AR 关闭后由 coordinator 清理
+                        presentARQuickLook(result: result, usdzPath: outPath, tempPath: outPath)
+                    }
+                }
+            }
         }
+    }
+
+    private static func presentARQuickLook(result: @escaping FlutterResult,
+                                           usdzPath: String,
+                                           tempPath: String?) {
+        guard let top = ViewUtils.topViewController() else {
+            result(["msg": "无法获取当前界面"] as [String: Any])
+            return
+        }
+        let url         = URL(fileURLWithPath: usdzPath)
+        let coordinator = ARQLCoordinator(url: url, result: result, tempPath: tempPath)
+        let qlVC        = QLPreviewController()
+        qlVC.dataSource = coordinator
+        qlVC.delegate   = coordinator
+        qlVC.modalPresentationStyle = .fullScreen
+        objc_setAssociatedObject(qlVC, &ARQLCoordinator.key,
+                                 coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        top.present(qlVC, animated: true)
     }
 
     //打开USDZ文件
@@ -226,10 +258,13 @@ private class ARQLCoordinator: NSObject, QLPreviewControllerDataSource, QLPrevie
     static var key: UInt8 = 0
     let fileURL: URL
     let flutterResult: FlutterResult
+    /// 转换产生的临时 USDZ 路径，AR 关闭后自动删除；原本就是 USDZ 时为 nil
+    let tempPath: String?
 
-    init(url: URL, result: @escaping FlutterResult) {
+    init(url: URL, result: @escaping FlutterResult, tempPath: String? = nil) {
         self.fileURL      = url
         self.flutterResult = result
+        self.tempPath     = tempPath
     }
 
     // MARK: QLPreviewControllerDataSource
@@ -238,7 +273,6 @@ private class ARQLCoordinator: NSObject, QLPreviewControllerDataSource, QLPrevie
 
     func previewController(_ controller: QLPreviewController,
                            previewItemAt index: Int) -> QLPreviewItem {
-        // ARQuickLookPreviewItem 直接进入 AR 模式，allowsContentScaling 允许用户缩放
         let item = ARQuickLookPreviewItem(fileAt: fileURL)
         item.allowsContentScaling = true
         return item
@@ -247,6 +281,10 @@ private class ARQLCoordinator: NSObject, QLPreviewControllerDataSource, QLPrevie
     // MARK: QLPreviewControllerDelegate
 
     func previewControllerDidDismiss(_ controller: QLPreviewController) {
+        // 清理临时转换文件
+        if let tmp = tempPath {
+            try? FileManager.default.removeItem(atPath: tmp)
+        }
         flutterResult(["msg": "success"] as [String: Any])
     }
 }
