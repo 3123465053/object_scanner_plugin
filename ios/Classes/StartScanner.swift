@@ -6,7 +6,7 @@
 
 import Flutter
 import QuickLook
-import WebKit
+import ARKit
 
 //开始扫描
 //这里把扫描的方法做个统一管理
@@ -169,7 +169,9 @@ struct StartScanner{
     }
 
     // AR Quick Look 预览
-    // 通过 WKWebView 的 rel="ar" 锚点直接全屏 AR，跳过 QLPreviewController 底部 sheet
+    // 使用 ARQuickLookPreviewItem + QLPreviewController(.fullScreen)
+    // ARQuickLookPreviewItem 会直接以 AR 模式打开（跳过 3D 对象预览页），
+    // .fullScreen 保证不会以底部 sheet 形式弹出。
     static func openARQuickLook(result: @escaping FlutterResult, path: String) {
         guard FileManager.default.fileExists(atPath: path) else {
             result(["msg": "文件不存在: \(path)"] as [String: Any])
@@ -180,8 +182,16 @@ struct StartScanner{
                 result(["msg": "无法获取当前界面"] as [String: Any])
                 return
             }
-            let arVC = ARQuickLookViewController(filePath: path, result: result)
-            top.present(arVC, animated: true)
+            let url         = URL(fileURLWithPath: path)
+            let coordinator = ARQLCoordinator(url: url, result: result)
+            let qlVC        = QLPreviewController()
+            qlVC.dataSource = coordinator
+            qlVC.delegate   = coordinator
+            qlVC.modalPresentationStyle = .fullScreen
+            // 持有 coordinator，防止 ARC 提前释放
+            objc_setAssociatedObject(qlVC, &ARQLCoordinator.key,
+                                     coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            top.present(qlVC, animated: true)
         }
     }
 
@@ -208,103 +218,35 @@ struct StartScanner{
 
 }
 
-// MARK: - ARQuickLookViewController
-// WKWebView + rel="ar" 锚点直接触发 iOS AR Quick Look 全屏，跳过 QLPreviewController sheet
+// MARK: - ARQLCoordinator
+// QLPreviewController 的 DataSource + Delegate。
+// ARQuickLookPreviewItem 会直接以 AR 模式打开 USDZ，无需用户手动切换标签。
 
-class ARQuickLookViewController: UIViewController {
+private class ARQLCoordinator: NSObject, QLPreviewControllerDataSource, QLPreviewControllerDelegate {
+    static var key: UInt8 = 0
+    let fileURL: URL
+    let flutterResult: FlutterResult
 
-    private let filePath: String
-    private let flutterResult: FlutterResult
-    private var webView: WKWebView!
-    /// 首次 viewDidAppear 后置为 true；再次触发说明 AR Quick Look 已关闭
-    private var firstAppearanceDone = false
-
-    init(filePath: String, result: @escaping FlutterResult) {
-        self.filePath = filePath
+    init(url: URL, result: @escaping FlutterResult) {
+        self.fileURL      = url
         self.flutterResult = result
-        super.init(nibName: nil, bundle: nil)
-        modalPresentationStyle = .fullScreen
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+    // MARK: QLPreviewControllerDataSource
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .black
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
 
-        // ── WKWebView ──────────────────────────────────────────────────────
-        let config = WKWebViewConfiguration()
-        config.allowsInlineMediaPlayback = true
-
-        webView = WKWebView(frame: view.bounds, configuration: config)
-        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
-        view.addSubview(webView)
-
-        // ── HTML：rel="ar" 锚点自动点击 ───────────────────────────────────
-        // baseURL 设为 USDZ 所在目录，href 用相对文件名，
-        // WKWebView 因此拥有本地文件读权限并能识别 AR 链接
-        let fileURL  = URL(fileURLWithPath: filePath)
-        let dir      = fileURL.deletingLastPathComponent()
-        let filename = fileURL.lastPathComponent
-
-        let html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-        </head>
-        <body style="margin:0;padding:0;background:#000;width:100vw;height:100vh;">
-          <a id="ar-link" rel="ar" href="\(filename)">
-            <canvas style="display:block;width:1px;height:1px;"></canvas>
-          </a>
-          <script>
-            window.addEventListener('load', function () {
-              setTimeout(function () {
-                document.getElementById('ar-link').click();
-              }, 300);
-            });
-          </script>
-        </body>
-        </html>
-        """
-        webView.loadHTMLString(html, baseURL: dir)
-
-        // ── 关闭按钮（兜底：AR 无法打开时可手动退出）─────────────────────
-        let closeBtn = UIButton(type: .system)
-        closeBtn.setImage(
-            UIImage(systemName: "xmark.circle.fill")?
-                .withConfiguration(UIImage.SymbolConfiguration(pointSize: 28, weight: .medium)),
-            for: .normal
-        )
-        closeBtn.tintColor = UIColor.white.withAlphaComponent(0.8)
-        closeBtn.translatesAutoresizingMaskIntoConstraints = false
-        closeBtn.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
-        view.addSubview(closeBtn)
-
-        NSLayoutConstraint.activate([
-            closeBtn.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            closeBtn.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            closeBtn.widthAnchor.constraint(equalToConstant: 44),
-            closeBtn.heightAnchor.constraint(equalToConstant: 44),
-        ])
+    func previewController(_ controller: QLPreviewController,
+                           previewItemAt index: Int) -> QLPreviewItem {
+        // ARQuickLookPreviewItem 直接进入 AR 模式，allowsContentScaling 允许用户缩放
+        let item = ARQuickLookPreviewItem(fileAt: fileURL)
+        item.allowsContentScaling = true
+        return item
     }
 
-    /// AR Quick Look 关闭后 iOS 会再次触发本 VC 的 viewDidAppear，
-    /// 用 firstAppearanceDone 区分首次出现与 AR 关闭后返回。
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        if firstAppearanceDone {
-            flutterResult(["msg": "success"] as [String: Any])
-            dismiss(animated: true)
-        }
-        firstAppearanceDone = true
-    }
+    // MARK: QLPreviewControllerDelegate
 
-    @objc private func closeTapped() {
-        flutterResult(["msg": "cancelled"] as [String: Any])
-        dismiss(animated: true)
+    func previewControllerDidDismiss(_ controller: QLPreviewController) {
+        flutterResult(["msg": "success"] as [String: Any])
     }
 }

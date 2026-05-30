@@ -124,6 +124,21 @@ class _MyAppState extends State<MyApp> {
                   },
                   child: const Text("格式转换测试"),
                 ),
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.view_in_ar_rounded),
+                  label: const Text("AR 预览测试"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    Navigator.of(ctx).push(
+                      MaterialPageRoute(
+                          builder: (_) => ARPreviewTestPage(
+                              plugin: _objectScannerPlugin)),
+                    );
+                  },
+                ),
               ],
             ),
           ),
@@ -550,6 +565,194 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
                   ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ── AR 预览测试页面 ───────────────────────────────────────────────────
+class ARPreviewTestPage extends StatefulWidget {
+  final ObjectScannerPlugin plugin;
+  const ARPreviewTestPage({super.key, required this.plugin});
+
+  @override
+  State<ARPreviewTestPage> createState() => _ARPreviewTestPageState();
+}
+
+class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
+  String? _usdzPath;
+  String? _usdzName;
+  String _status = '尚未选择文件';
+  bool _loading = false;
+
+  // ── 选择 USDZ 文件 ────────────────────────────────────────────────
+  Future<void> _pickUSDZ() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['usdz', 'usd', 'usda', 'usdc'],
+    );
+    if (result != null && result.files.single.path != null) {
+      setState(() {
+        _usdzPath = result.files.single.path;
+        _usdzName = result.files.single.name;
+        _status = '已选择：$_usdzName';
+      });
+    }
+  }
+
+  // ── 扫描后获取 USDZ ───────────────────────────────────────────────
+  Future<void> _scanForUSDZ() async {
+    setState(() { _loading = true; _status = '扫描中...'; });
+    try {
+      EasyLoading.show(status: "扫描中...");
+      final res = await widget.plugin.startScannerObject();
+      EasyLoading.dismiss();
+      final p = res?['path'] as String?;
+      if (p != null && p.isNotEmpty) {
+        setState(() {
+          _usdzPath = p;
+          _usdzName = p.split('/').last;
+          _status = '扫描完成：$_usdzName';
+        });
+      } else {
+        setState(() => _status = '扫描取消或失败');
+      }
+    } catch (e) {
+      EasyLoading.dismiss();
+      setState(() => _status = '扫描异常：$e');
+    } finally {
+      setState(() => _loading = false);
+    }
+  }
+
+  // ── 触发 AR 预览 ──────────────────────────────────────────────────
+  Future<void> _launchAR() async {
+    if (_usdzPath == null) {
+      setState(() => _status = '请先选择或扫描一个 USDZ 文件');
+      return;
+    }
+    setState(() { _loading = true; _status = 'AR 预览中...'; });
+    try {
+      final res = await widget.plugin.openARQuickLook(_usdzPath!);
+      final msg = res?['msg'] as String? ?? 'unknown';
+      setState(() => _status = 'AR 结束：$msg');
+    } catch (e) {
+      setState(() => _status = 'AR 异常：$e');
+    } finally {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('AR 预览测试')),
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+
+            // ── 状态卡片 ──
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.grey.shade300),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('状态', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  const SizedBox(height: 6),
+                  Text(_status, style: const TextStyle(fontSize: 12, color: Colors.black87)),
+                  if (_usdzPath != null) ...[
+                    const SizedBox(height: 4),
+                    Text(_usdzPath!,
+                        style: const TextStyle(fontSize: 10, color: Colors.grey),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis),
+                  ],
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // ── 获取文件 ──
+            const Text('第一步：获取 USDZ 文件',
+                style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+            const SizedBox(height: 10),
+
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _loading ? null : _pickUSDZ,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('从文件选择'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _loading ? null : _scanForUSDZ,
+                    icon: const Icon(Icons.document_scanner),
+                    label: const Text('扫描获取'),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.teal,
+                        foregroundColor: Colors.white),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 32),
+
+            // ── AR 预览 ──
+            const Text('第二步：启动 AR 预览',
+                style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+            const SizedBox(height: 10),
+
+            SizedBox(
+              height: 54,
+              child: ElevatedButton.icon(
+                onPressed: (_loading || _usdzPath == null) ? null : _launchAR,
+                icon: _loading
+                    ? const SizedBox(
+                        width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : const Icon(Icons.view_in_ar_rounded, size: 24),
+                label: Text(
+                  _loading ? '处理中...' : 'AR 预览',
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.deepPurple,
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: Colors.grey.shade300,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 16),
+
+            // ── 说明 ──
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Text(
+                '原理：通过 WKWebView 的 rel="ar" 锚点直接触发 iOS AR Quick Look，\n'
+                '完全跳过 QLPreviewController 底部 sheet 预览，与系统原生体验一致。',
+                style: TextStyle(fontSize: 11, color: Colors.black54, height: 1.5),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
