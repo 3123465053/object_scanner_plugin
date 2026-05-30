@@ -44,6 +44,11 @@ abstract class ObjectScannerPluginPlatform extends PlatformInterface {
     throw UnimplementedError('openUSDZ has not been implemented.');
   }
 
+  /// AR Quick Look 预览（WKWebView rel="ar"，直接全屏 AR，无底部 sheet）
+  openARQuickLook(String path) {
+    throw UnimplementedError('openARQuickLook has not been implemented.');
+  }
+
   /// 格式转换
   /// inputPath: 输入文件路径
   /// outputFormat: 目标格式

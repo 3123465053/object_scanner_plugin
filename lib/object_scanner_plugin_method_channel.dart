@@ -78,6 +78,13 @@ class MethodChannelObjectScannerPlugin extends ObjectScannerPluginPlatform {
     return res;
   }
 
+  // AR Quick Look（WKWebView rel="ar"，直接全屏 AR）
+  @override
+  openARQuickLook(String path) async {
+    var res = await methodChannel.invokeMethod("openARQuickLook", {"path": path});
+    return res;
+  }
+
   //格式转换（同步等待，保留原接口）
   @override
   convertFormat(String inputPath, String outputFormat) async {

@@ -66,6 +66,15 @@ public class ObjectScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         case "startScannerSpace":
             StartScanner.scannerSpace(result: result)
 
+        case "openARQuickLook":
+            guard let args = call.arguments as? [String: Any],
+                  let path = args["path"] as? String else {
+                result(FlutterError(code: "INVALID_ARGS",
+                                    message: "path is required", details: nil))
+                return
+            }
+            StartScanner.openARQuickLook(result: result, path: path)
+
         case "openUSDZ":
             guard let args = call.arguments as? [String: Any],
                   let path = args["path"] as? String else {

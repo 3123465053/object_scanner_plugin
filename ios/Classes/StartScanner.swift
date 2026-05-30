@@ -167,6 +167,23 @@ struct StartScanner{
         return resultURL
     }
 
+    // AR Quick Look 预览
+    // 通过 WKWebView 的 rel="ar" 锚点直接全屏 AR，跳过 QLPreviewController 底部 sheet
+    static func openARQuickLook(result: @escaping FlutterResult, path: String) {
+        guard FileManager.default.fileExists(atPath: path) else {
+            result(["msg": "文件不存在: \(path)"] as [String: Any])
+            return
+        }
+        DispatchQueue.main.async {
+            guard let top = ViewUtils.topViewController() else {
+                result(["msg": "无法获取当前界面"] as [String: Any])
+                return
+            }
+            let arVC = ARQuickLookViewController(filePath: path, result: result)
+            top.present(arVC, animated: true)
+        }
+    }
+
     //打开USDZ文件
     static func openUSDZ(result: @escaping FlutterResult,path:String){
         

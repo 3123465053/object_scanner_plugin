@@ -26,6 +26,11 @@ class ObjectScannerPlugin {
     return ObjectScannerPluginPlatform.instance.openUSDZ(path);
   }
 
+  // AR Quick Look（WKWebView rel="ar"，直接全屏 AR，无底部 sheet）
+  openARQuickLook(String path) {
+    return ObjectScannerPluginPlatform.instance.openARQuickLook(path);
+  }
+
   //格式转换
   // outputFormat 支持的输出格式:
   //   obj, stl, ply, usd, usda, usdc, abc  -- 通过 ModelIO
