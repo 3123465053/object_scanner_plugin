@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 
 import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:object_scanner_plugin/object_scanner_plugin.dart';
 import 'package:flutter_easyloading/flutter_easyloading.dart';
 import 'package:file_picker/file_picker.dart';
+
+import 'l10n.dart';
 
 void main() {
   configLoading();
@@ -19,6 +22,36 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      supportedLocales: const [Locale('zh'), Locale('en')],
+      localizationsDelegates: const [
+        AppLocalizations.delegate,
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      home: const HomePage(),
+      builder: EasyLoading.init(builder: (context, widget) {
+        return MediaQuery(
+          data: MediaQuery.of(context).copyWith(textScaleFactor: 1.0),
+          child: widget!,
+        );
+      }),
+    );
+  }
+}
+
+// ── 主页 ─────────────────────────────────────────────────────────────
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
   String _platformVersion = 'Unknown';
   final _objectScannerPlugin = ObjectScannerPlugin();
   String? path = "";
@@ -44,112 +77,100 @@ class _MyAppState extends State<MyApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Builder(
-        builder: (ctx) => Scaffold(
-          appBar: AppBar(title: const Text('Plugin example app')),
-          body: Center(
-            child: Column(
-              children: [
-                Text('Running on: $_platformVersion\n'),
-                ElevatedButton(
-                  onPressed: () async {
-                    try {
-                      EasyLoading.show(status: "loading...");
-                      var res = await _objectScannerPlugin.startScannerObject();
-                      EasyLoading.dismiss();
-                      print(res);
-                      setState(() { path = res["path"]; });
-                    } catch (e) {
-                      print(e);
-                      EasyLoading.dismiss();
-                    }
-                  },
-                  child: const Text("开始扫描"),
-                ),
-                ElevatedButton(
-                  onPressed: () async {
-                    try {
-                      EasyLoading.show(status: "loading...");
-                      var res = await _objectScannerPlugin.startScannerRoom();
-                      EasyLoading.dismiss();
-                      print(res);
-                      setState(() { path = res["path"]; });
-                    } catch (e) {
-                      print(e);
-                      EasyLoading.dismiss();
-                    }
-                  },
-                  child: const Text("扫描房间"),
-                ),
-                ElevatedButton(
-                  onPressed: () async {
-                    try {
-                      EasyLoading.show(status: "loading...");
-                      var res = await _objectScannerPlugin.startScannerSpace();
-                      EasyLoading.dismiss();
-                      print(res);
-                      setState(() { path = res["path"]; });
-                    } catch (e) {
-                      print(e);
-                      EasyLoading.dismiss();
-                    }
-                  },
-                  child: const Text("扫描空间"),
+    final l10n = AppLocalizations.of(context);
+
+    return Scaffold(
+      appBar: AppBar(title: Text(l10n.appTitle)),
+      body: Builder(
+        builder: (ctx) => Center(
+          child: Column(
+            children: [
+              Text('${l10n.runningOn}$_platformVersion\n'),
+              ElevatedButton(
+                onPressed: () async {
+                  try {
+                    EasyLoading.show(status: l10n.loading);
+                    var res = await _objectScannerPlugin.startScannerObject();
+                    EasyLoading.dismiss();
+                    setState(() { path = res["path"]; });
+                  } catch (e) {
+                    EasyLoading.dismiss();
+                  }
+                },
+                child: Text(l10n.startScan),
+              ),
+              ElevatedButton(
+                onPressed: () async {
+                  try {
+                    EasyLoading.show(status: l10n.loading);
+                    var res = await _objectScannerPlugin.startScannerRoom();
+                    EasyLoading.dismiss();
+                    setState(() { path = res["path"]; });
+                  } catch (e) {
+                    EasyLoading.dismiss();
+                  }
+                },
+                child: Text(l10n.scanRoom),
+              ),
+              ElevatedButton(
+                onPressed: () async {
+                  try {
+                    EasyLoading.show(status: l10n.loading);
+                    var res = await _objectScannerPlugin.startScannerSpace();
+                    EasyLoading.dismiss();
+                    setState(() { path = res["path"]; });
+                  } catch (e) {
+                    EasyLoading.dismiss();
+                  }
+                },
+                child: Text(l10n.scanSpace),
+              ),
+
+              if (path != null && path!.isNotEmpty)
+                SizedBox(
+                  width: double.infinity,
+                  height: 400,
+                  child: UiKitView(
+                    key: ValueKey(path),
+                    viewType: "swift_ui_view",
+                    onPlatformViewCreated: (id) {
+                      MethodChannel('swift_ui_view_$id').invokeMethod(
+                          'setParams',
+                          {'view_type': 'usdz_preview_view', 'path': path});
+                    },
+                    creationParamsCodec: const StandardMessageCodec(),
+                  ),
                 ),
 
-                if (path != null && path!.isNotEmpty)
-                  SizedBox(
-                    width: double.infinity,
-                    height: 400,
-                    child: UiKitView(
-                      key: ValueKey(path),
-                      viewType: "swift_ui_view",
-                      onPlatformViewCreated: (id) {
-                        MethodChannel('swift_ui_view_$id').invokeMethod(
-                            'setParams',
-                            {'view_type': 'usdz_preview_view', 'path': path});
-                      },
-                      creationParamsCodec: const StandardMessageCodec(),
-                    ),
-                  ),
-
-                ElevatedButton(
-                  onPressed: () {
-                    Navigator.of(ctx).push(
-                      MaterialPageRoute(
-                          builder: (_) => FormatConvertTestPage(
-                              plugin: _objectScannerPlugin)),
-                    );
-                  },
-                  child: const Text("格式转换测试"),
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.of(ctx).push(
+                    MaterialPageRoute(
+                        builder: (_) => FormatConvertTestPage(
+                            plugin: _objectScannerPlugin)),
+                  );
+                },
+                child: Text(l10n.formatConvertTest),
+              ),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.view_in_ar_rounded),
+                label: Text(l10n.arPreviewTest),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.deepPurple,
+                  foregroundColor: Colors.white,
                 ),
-                ElevatedButton.icon(
-                  icon: const Icon(Icons.view_in_ar_rounded),
-                  label: const Text("AR 预览测试"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.deepPurple,
-                    foregroundColor: Colors.white,
-                  ),
-                  onPressed: () {
-                    Navigator.of(ctx).push(
-                      MaterialPageRoute(
-                          builder: (_) => ARPreviewTestPage(
-                              plugin: _objectScannerPlugin)),
-                    );
-                  },
-                ),
-              ],
-            ),
+                onPressed: () {
+                  Navigator.of(ctx).push(
+                    MaterialPageRoute(
+                        builder: (_) => ARPreviewTestPage(
+                            plugin: _objectScannerPlugin)),
+                  );
+                },
+              ),
+            ],
           ),
         ),
       ),
-      builder: EasyLoading.init(builder: (context, widget) {
-        return MediaQuery(
-          data: MediaQuery.of(context).copyWith(textScaleFactor: 1.0),
-          child: widget!,
-        );
-      }),
     );
   }
 }
@@ -163,6 +184,19 @@ class FormatConvertTestPage extends StatefulWidget {
   State<FormatConvertTestPage> createState() => _FormatConvertTestPageState();
 }
 
+class _ConversionResult {
+  final String format;
+  final bool isSuccess;
+  final String? outputPath;
+  final String nativeMsg;
+  _ConversionResult({
+    required this.format,
+    required this.isSuccess,
+    this.outputPath,
+    required this.nativeMsg,
+  });
+}
+
 class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
   String? _inputPath;
   String? _inputFileName;
@@ -174,20 +208,15 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
     'usdz', 'scn', 'glb', 'gltf',
   ];
 
-  // 转换结果列表
-  final List<Map<String, String>> _results = [];
+  final List<_ConversionResult> _results = [];
 
-  // 后台转换状态
   StreamSubscription<Map<String, dynamic>>? _resultSub;
-  final Set<String> _converting = {};         // 正在转换的格式名
-  final Map<String, String> _jobToFormat = {}; // jobId → format
-
-  // ── 生命周期 ──────────────────────────────────────────────────────
+  final Set<String> _converting = {};
+  final Map<String, String> _jobToFormat = {};
 
   @override
   void initState() {
     super.initState();
-    // 订阅后台转换结果流
     _resultSub = widget.plugin.conversionResultStream.listen(_onConversionResult);
   }
 
@@ -197,27 +226,25 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
     super.dispose();
   }
 
-  // ── 后台结果回调 ──────────────────────────────────────────────────
-
   void _onConversionResult(Map<String, dynamic> event) {
+    if (!mounted) return;
     final jobId  = event['jobId']  as String?  ?? '';
     final format = _jobToFormat.remove(jobId);
-    if (format == null) return; // 非本页发起的任务
+    if (format == null) return;
 
     final msg  = event['msg']  as String? ?? 'unknown';
     final path = event['path'] as String?;
 
     setState(() {
       _converting.remove(format);
-      if (msg == 'success' && path != null) {
-        _addResult(format, '成功: ${path.split('/').last}', path);
-      } else {
-        _addResult(format, '失败: $msg', null);
-      }
+      _addResult(_ConversionResult(
+        format: format,
+        isSuccess: msg == 'success' && path != null,
+        outputPath: path,
+        nativeMsg: msg,
+      ));
     });
   }
-
-  // ── 操作 ──────────────────────────────────────────────────────────
 
   Future<void> _pickFile() async {
     final result = await FilePicker.platform.pickFiles(type: FileType.any);
@@ -225,7 +252,6 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
       setState(() {
         _inputPath = result.files.single.path;
         _inputFileName = result.files.single.name;
-        // 切换文件时清空旧结果
         _results.clear();
         _converting.clear();
         _jobToFormat.clear();
@@ -234,8 +260,9 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
   }
 
   Future<void> _scanForInput() async {
+    final l10n = AppLocalizations.of(context);
     try {
-      EasyLoading.show(status: "扫描中...");
+      EasyLoading.show(status: l10n.scanning);
       var res = await widget.plugin.startScannerObject();
       EasyLoading.dismiss();
       if (res != null && res["path"] != null) {
@@ -249,14 +276,19 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
       }
     } catch (e) {
       EasyLoading.dismiss();
-      _addResult("扫描", "失败: $e", null);
+      if (mounted) {
+        _addResult(_ConversionResult(
+          format: AppLocalizations.of(context).scanning,
+          isSuccess: false,
+          nativeMsg: e.toString(),
+        ));
+      }
     }
   }
 
-  /// 启动单个格式的后台转换（立即返回，不阻塞 UI）
   Future<void> _convert(String format) async {
     if (_inputPath == null || _inputPath!.isEmpty) {
-      _addResult(format, "请先选择输入文件", null);
+      _addResult(_ConversionResult(format: format, isSuccess: false, nativeMsg: 'no_input'));
       return;
     }
     if (_converting.contains(format)) return;
@@ -267,33 +299,26 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
     } catch (e) {
       setState(() {
         _converting.remove(format);
-        _addResult(format, '启动失败: $e', null);
+        _addResult(_ConversionResult(format: format, isSuccess: false, nativeMsg: 'start_failed:${e.toString()}'));
       });
     }
   }
 
-  /// 全部测试：立即把所有格式投入 iOS 串行队列，Flutter 不等待
-  /// iOS conversionQueue 保证同一时刻只跑一个，Scene 缓存对后续格式生效
-  /// Flutter 侧可同时看到所有格式的 "转换中" chip
   Future<void> _convertAll() async {
     if (_inputPath == null || _inputPath!.isEmpty) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text("请先选择输入文件")));
+          .showSnackBar(SnackBar(content: Text(AppLocalizations.of(context).selectInputFirst)));
       return;
     }
     for (final fmt in _formats) {
-      await _convert(fmt); // _convert 立即返回（只发消息，不等结果）
+      await _convert(fmt);
     }
   }
 
-  void _addResult(String format, String msg, String? outputPath) {
-    // 同一格式的新结果插到顶部（移除旧的）
-    _results.removeWhere((r) => r['format'] == format);
-    _results.insert(0, {
-      'format': format,
-      'msg': msg,
-      if (outputPath != null) 'path': outputPath,
-    });
+  void _addResult(_ConversionResult result) {
+    _results.removeWhere((r) => r.format == result.format);
+    _results.insert(0, result);
   }
 
   void _preview(String path) {
@@ -306,28 +331,28 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
   }
 
   Future<void> _export(String path) async {
+    final l10n = AppLocalizations.of(context);
     try {
       var res = await widget.plugin.exportFile(path);
       final msg = res?["msg"] ?? "unknown";
       if (msg == "success") {
-        EasyLoading.showSuccess("导出成功");
-      } else if (msg != "已取消") {
-        EasyLoading.showError("导出失败: $msg");
+        EasyLoading.showSuccess(l10n.exportSuccess);
+      } else if (msg != "cancelled") {
+        EasyLoading.showError(l10n.exportFailed(msg));
       }
     } catch (e) {
-      EasyLoading.showError("导出异常: $e");
+      EasyLoading.showError(l10n.exportError(e.toString()));
     }
   }
 
-  // ── UI ───────────────────────────────────────────────────────────
-
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context);
     final doneCount  = _results.length;
     final totalCount = _converting.length + doneCount;
 
     return Scaffold(
-      appBar: AppBar(title: const Text("格式转换测试")),
+      appBar: AppBar(title: Text(l10n.formatConvertTitle)),
       body: Column(
         children: [
           // ── 输入文件 ──
@@ -338,10 +363,10 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text("输入文件:", style: TextStyle(fontWeight: FontWeight.bold)),
+                Text(l10n.inputFile, style: const TextStyle(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 4),
                 Text(
-                  _inputFileName ?? "未选择",
+                  _inputFileName ?? l10n.notSelected,
                   style: TextStyle(
                       fontSize: 12,
                       color: _inputPath != null ? Colors.black : Colors.red),
@@ -362,12 +387,12 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
                     ElevatedButton.icon(
                         onPressed: _pickFile,
                         icon: const Icon(Icons.folder_open, size: 18),
-                        label: const Text("选择文件")),
+                        label: Text(l10n.chooseFile)),
                     const SizedBox(width: 12),
                     ElevatedButton.icon(
                         onPressed: _scanForInput,
                         icon: const Icon(Icons.view_in_ar, size: 18),
-                        label: const Text("扫描获取")),
+                        label: Text(l10n.scanForInput)),
                   ],
                 ),
               ],
@@ -381,7 +406,7 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             child: Row(
               children: [
-                const Text("输出: "),
+                Text(l10n.output),
                 DropdownButton<String>(
                   value: _selectedFormat,
                   items: _formats
@@ -392,20 +417,20 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
                 const SizedBox(width: 8),
                 ElevatedButton(
                   onPressed: () => _convert(_selectedFormat),
-                  child: const Text("转换"),
+                  child: Text(l10n.convert),
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton(
                   onPressed: _convertAll,
                   style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
-                  child: const Text("全部测试",
-                      style: TextStyle(color: Colors.white)),
+                  child: Text(l10n.testAll,
+                      style: const TextStyle(color: Colors.white)),
                 ),
               ],
             ),
           ),
 
-          // ── 后台进度条：有转换中的格式时显示 ──
+          // ── 后台进度条 ──
           if (_converting.isNotEmpty)
             Container(
               width: double.infinity,
@@ -423,14 +448,13 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        "后台转换中：$doneCount / $totalCount 完成",
+                        l10n.bgConverting(doneCount, totalCount),
                         style: TextStyle(
                             fontSize: 12, color: Colors.blue.shade800),
                       ),
                     ],
                   ),
                   const SizedBox(height: 4),
-                  // 正在转换的格式 chip
                   Wrap(
                     spacing: 6,
                     runSpacing: 4,
@@ -474,7 +498,7 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(
-                          "预览: ${_previewPath!.split('/').last}",
+                          l10n.previewFile(_previewPath!.split('/').last),
                           style: TextStyle(
                               fontSize: 12,
                               color: Colors.blue.shade800),
@@ -511,55 +535,62 @@ class _FormatConvertTestPageState extends State<FormatConvertTestPage> {
           // ── 结果列表 ──
           Expanded(
             child: _results.isEmpty && _converting.isEmpty
-                ? const Center(
-                    child: Text("暂无转换结果",
-                        style: TextStyle(color: Colors.grey)))
+                ? Center(
+                    child: Text(l10n.noResults,
+                        style: const TextStyle(color: Colors.grey)))
                 : ListView.separated(
                     padding: const EdgeInsets.all(8),
                     itemCount: _results.length,
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (_, i) {
-                      final r      = _results[i];
-                      final ok     = r["msg"]!.startsWith("成功");
-                      final hasPath = r.containsKey("path");
+                      final r = _results[i];
+                      final displayMsg = r.isSuccess
+                          ? l10n.successMsg(r.outputPath!.split('/').last)
+                          : r.nativeMsg == 'no_input'
+                              ? l10n.selectInputFirst
+                              : r.nativeMsg.startsWith('start_failed:')
+                                  ? l10n.startFailedMsg(r.nativeMsg.substring(13))
+                                  : l10n.failedMsg(r.nativeMsg);
                       return ListTile(
                         dense: true,
                         leading: Icon(
-                          ok ? Icons.check_circle : Icons.error,
-                          color: ok ? Colors.green : Colors.red,
+                          r.isSuccess ? Icons.check_circle : Icons.error,
+                          color: r.isSuccess ? Colors.green : Colors.red,
                           size: 20,
                         ),
-                        title: Text(r["format"]!.toUpperCase(),
+                        title: Text(r.format.toUpperCase(),
                             style: const TextStyle(
                                 fontWeight: FontWeight.bold, fontSize: 14)),
-                        subtitle: Text(r["msg"]!,
+                        subtitle: Text(displayMsg,
                             style: const TextStyle(fontSize: 11),
                             maxLines: 2),
-                        trailing: hasPath
+                        trailing: r.isSuccess && r.outputPath != null
                             ? Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
                                   IconButton(
                                     icon: const Icon(Icons.visibility,
                                         color: Colors.blue, size: 22),
-                                    tooltip: "预览",
+                                    tooltip: l10n.preview,
                                     padding: EdgeInsets.zero,
                                     constraints: const BoxConstraints(),
-                                    onPressed: () => _preview(r["path"]!),
+                                    onPressed: () => _preview(r.outputPath!),
                                   ),
                                   const SizedBox(width: 8),
                                   IconButton(
                                     icon: const Icon(Icons.ios_share,
                                         color: Colors.green, size: 22),
-                                    tooltip: "导出",
+                                    tooltip: l10n.export,
                                     padding: EdgeInsets.zero,
                                     constraints: const BoxConstraints(),
-                                    onPressed: () => _export(r["path"]!),
+                                    onPressed: () => _export(r.outputPath!),
                                   ),
                                 ],
                               )
                             : null,
-                        onTap: hasPath ? () => _preview(r["path"]!) : null,
+                        onTap: r.isSuccess && r.outputPath != null
+                            ? () => _preview(r.outputPath!)
+                            : null,
                       );
                     },
                   ),
@@ -582,11 +613,17 @@ class ARPreviewTestPage extends StatefulWidget {
 class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
   String? _usdzPath;
   String? _usdzName;
-  String _status = '尚未选择文件';
+  late String _status;
   bool _loading = false;
 
-  // ── 选择 USDZ 文件 ────────────────────────────────────────────────
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _status = AppLocalizations.of(context).noFileSelected;
+  }
+
   Future<void> _pickUSDZ() async {
+    final l10n = AppLocalizations.of(context);
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['usdz', 'usd', 'usda', 'usdc'],
@@ -595,16 +632,16 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
       setState(() {
         _usdzPath = result.files.single.path;
         _usdzName = result.files.single.name;
-        _status = '已选择：$_usdzName';
+        _status = l10n.selectedFile(_usdzName!);
       });
     }
   }
 
-  // ── 扫描后获取 USDZ ───────────────────────────────────────────────
   Future<void> _scanForUSDZ() async {
-    setState(() { _loading = true; _status = '扫描中...'; });
+    final l10n = AppLocalizations.of(context);
+    setState(() { _loading = true; _status = l10n.scanning; });
     try {
-      EasyLoading.show(status: "扫描中...");
+      EasyLoading.show(status: l10n.scanning);
       final res = await widget.plugin.startScannerObject();
       EasyLoading.dismiss();
       final p = res?['path'] as String?;
@@ -612,32 +649,32 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
         setState(() {
           _usdzPath = p;
           _usdzName = p.split('/').last;
-          _status = '扫描完成：$_usdzName';
+          _status = l10n.scanComplete(_usdzName!);
         });
       } else {
-        setState(() => _status = '扫描取消或失败');
+        setState(() => _status = l10n.scanCancelledOrFailed);
       }
     } catch (e) {
       EasyLoading.dismiss();
-      setState(() => _status = '扫描异常：$e');
+      setState(() => _status = l10n.scanError(e.toString()));
     } finally {
       setState(() => _loading = false);
     }
   }
 
-  // ── 触发 AR 预览 ──────────────────────────────────────────────────
   Future<void> _launchAR() async {
+    final l10n = AppLocalizations.of(context);
     if (_usdzPath == null) {
-      setState(() => _status = '请先选择或扫描一个 USDZ 文件');
+      setState(() => _status = l10n.selectOrScanUSDZFirst);
       return;
     }
-    setState(() { _loading = true; _status = 'AR 预览中...'; });
+    setState(() { _loading = true; _status = l10n.processing; });
     try {
       final res = await widget.plugin.openARQuickLook(_usdzPath!);
       final msg = res?['msg'] as String? ?? 'unknown';
-      setState(() => _status = 'AR 结束：$msg');
+      setState(() => _status = l10n.arEnded(msg));
     } catch (e) {
-      setState(() => _status = 'AR 异常：$e');
+      setState(() => _status = l10n.arError(e.toString()));
     } finally {
       setState(() => _loading = false);
     }
@@ -645,8 +682,10 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context);
+
     return Scaffold(
-      appBar: AppBar(title: const Text('AR 预览测试')),
+      appBar: AppBar(title: Text(l10n.arPreviewTitle)),
       body: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(
@@ -664,7 +703,7 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('状态', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  Text(l10n.status, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                   const SizedBox(height: 6),
                   Text(_status, style: const TextStyle(fontSize: 12, color: Colors.black87)),
                   if (_usdzPath != null) ...[
@@ -681,8 +720,8 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
             const SizedBox(height: 24),
 
             // ── 获取文件 ──
-            const Text('第一步：获取 USDZ 文件',
-                style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+            Text(l10n.step1,
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
             const SizedBox(height: 10),
 
             Row(
@@ -691,7 +730,7 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
                   child: ElevatedButton.icon(
                     onPressed: _loading ? null : _pickUSDZ,
                     icon: const Icon(Icons.folder_open),
-                    label: const Text('从文件选择'),
+                    label: Text(l10n.chooseFromFiles),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -699,7 +738,7 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
                   child: ElevatedButton.icon(
                     onPressed: _loading ? null : _scanForUSDZ,
                     icon: const Icon(Icons.document_scanner),
-                    label: const Text('扫描获取'),
+                    label: Text(l10n.scanForInput),
                     style: ElevatedButton.styleFrom(backgroundColor: Colors.teal,
                         foregroundColor: Colors.white),
                   ),
@@ -710,8 +749,8 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
             const SizedBox(height: 32),
 
             // ── AR 预览 ──
-            const Text('第二步：启动 AR 预览',
-                style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+            Text(l10n.step2,
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
             const SizedBox(height: 10),
 
             SizedBox(
@@ -724,7 +763,7 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
                         child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                     : const Icon(Icons.view_in_ar_rounded, size: 24),
                 label: Text(
-                  _loading ? '处理中...' : 'AR 预览',
+                  _loading ? l10n.processing : l10n.arPreview,
                   style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
                 ),
                 style: ElevatedButton.styleFrom(
@@ -745,10 +784,9 @@ class _ARPreviewTestPageState extends State<ARPreviewTestPage> {
                 color: Colors.blue.shade50,
                 borderRadius: BorderRadius.circular(10),
               ),
-              child: const Text(
-                '原理：通过 WKWebView 的 rel="ar" 锚点直接触发 iOS AR Quick Look，\n'
-                '完全跳过 QLPreviewController 底部 sheet 预览，与系统原生体验一致。',
-                style: TextStyle(fontSize: 11, color: Colors.black54, height: 1.5),
+              child: Text(
+                l10n.arTip,
+                style: const TextStyle(fontSize: 11, color: Colors.black54, height: 1.5),
               ),
             ),
           ],

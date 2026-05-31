@@ -210,11 +210,11 @@ struct RoomScannerView: View {
                         .font(.system(size: 60))
                         .foregroundColor(.orange)
                     
-                    Text("设备不支持 RoomPlan")
+                    Text(L10n.noSupportRoomPlan)
                         .font(.title3)
                         .foregroundColor(.white)
-                    
-                    Text("需要支持 LiDAR 的设备\n(iPhone 12 Pro 及以上)")
+
+                    Text(L10n.requiresLiDAR)
                         .font(.caption)
                         .foregroundColor(.gray)
                         .multilineTextAlignment(.center)
@@ -230,7 +230,7 @@ struct RoomScannerView: View {
             Spacer()
             HStack(spacing: 20) {
                 if roomController.isScanning {
-                    Button("完成扫描") {
+                    Button(L10n.doneScan) {
                         dismiss()
                         roomController.stopSession()
                     }
@@ -275,7 +275,7 @@ struct RoomScannerView: View {
     var topActionBtn: some View {
         HStack{
             
-            Button("关闭"){
+            Button(L10n.close){
                 dismiss()
                 ObjectScannerPlugin.pendingResult?([
                     "path":"",
@@ -338,15 +338,15 @@ struct UnsupportedDeviceView: View {
                 .font(.system(size: 80))
                 .foregroundColor(.orange)
             
-            Text("设备不支持")
+            Text(L10n.deviceNotSupported)
                 .font(.title)
                 .foregroundColor(.red)
-            
-            Text("此设备不支持 LiDAR 技术")
+
+            Text(L10n.noLiDAR)
                 .font(.body)
                 .multilineTextAlignment(.center)
-            
-            Text("需要 iPhone 12 Pro 或更新的设备")
+
+            Text(L10n.requiresIPhone12Pro)
                 .font(.caption)
                 .foregroundColor(.gray)
         }

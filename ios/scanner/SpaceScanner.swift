@@ -491,19 +491,19 @@ struct SpaceScanView: View {
                 }
             
             VStack(spacing: 12) {
-                Text("慢慢移动设备扫描物体")
+                Text(L10n.moveToScan)
                     .font(.headline)
                     .foregroundColor(.white)
                     .padding(8)
                     .background(Color.black.opacity(0.6))
                     .cornerRadius(8)
-                
+
                 Button(action: {
                     if let _ = viewModel.stopScanningAndExport() {
                         dismiss()
                     }
                 }) {
-                    Text("停止并导出")
+                    Text(L10n.stopAndExport)
                         .font(.headline)
                         .foregroundColor(.white)
                         .padding(.horizontal, 32)

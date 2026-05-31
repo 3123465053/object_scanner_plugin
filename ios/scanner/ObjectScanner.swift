@@ -216,15 +216,15 @@ struct ObjectScannerView: View {
                     //用来占位的
                     Text("")
                     if case .ready = objectScanner.session?.state {
-                        Button("开始捕捉") {
+                        Button(L10n.startCapture) {
                             objectScanner.session?.startCapturing()
                         }
                         .buttonStyle(.borderedProminent)
                     }
-                    
+
                     // 只要在捕捉状态，就允许手动结束
                     else if case .capturing = objectScanner.session?.state {
-                        Button("结束并生成模型") {
+                        Button(L10n.finishAndBuild) {
                             if objectScanner.capturedImageCount < 10{
                                 showAlter = true
                                 return
@@ -235,17 +235,17 @@ struct ObjectScannerView: View {
                         .background(Color.red)
                         .foregroundColor(.white)
                         .cornerRadius(12)
-                        .alert("提示", isPresented: $showAlter, actions:{
-                            Button("立即生成", role: .destructive) {
+                        .alert(L10n.notice, isPresented: $showAlter, actions:{
+                            Button(L10n.generateNow, role: .destructive) {
                                 objectScanner.stopCaptureAndStartReconstruction()
                             }
-                            Button("取消", role: .cancel) {}
+                            Button(L10n.cancel, role: .cancel) {}
                         } ,message:{
-                            Text("图片数量过少，模型生成可能不成功，请确保有10张以上的图片")
+                            Text(L10n.tooFewImages)
                         },)
                     } else
                     {
-                        Text("默认文本")
+                        Text(L10n.ready)
                     }
                     
                     VStack{
@@ -267,7 +267,7 @@ struct ObjectScannerView: View {
     //关闭按钮
     var topActionBtn: some View {
         HStack{
-            Button("关闭"){
+            Button(L10n.close){
                 dismiss()
                 ObjectScannerPlugin.pendingResult?([
                     "path":"",
@@ -280,7 +280,7 @@ struct ObjectScannerView: View {
             Spacer()
             if case .ready = objectScanner.session?.state
             {
-                Text("请将中心点对准物体")
+                Text(L10n.aimAtObject)
                     .foregroundStyle(.white)
             }
             Spacer()
@@ -313,12 +313,12 @@ struct GenerateProgressView:View {
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
                     .padding()
-                Text("正在生成 3D 模型: \(Int(progress * 100))%")
-                Text("(关闭会停止模型生成)")
+                Text(L10n.generatingModel(Int(progress * 100)))
+                Text(L10n.closingWillStop)
                 Spacer()
             }
             .interactiveDismissDisabled(true)  //为true 不能通过手势下拉的方式关闭弹窗
-            Button("关闭"){
+            Button(L10n.close){
                 dismiss()
             }
             .glassIfAvailable()
