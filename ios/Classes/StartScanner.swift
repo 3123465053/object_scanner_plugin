@@ -285,6 +285,9 @@ private class ARQLCoordinator: NSObject, QLPreviewControllerDataSource, QLPrevie
         if let tmp = tempPath {
             try? FileManager.default.removeItem(atPath: tmp)
         }
+        // 释放 coordinator 引用，让 QLPreviewController 和 AR Session 被回收
+        objc_setAssociatedObject(controller, &ARQLCoordinator.key,
+                                 nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         flutterResult(["msg": "success"] as [String: Any])
     }
 }
