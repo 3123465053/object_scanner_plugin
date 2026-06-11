@@ -4,474 +4,470 @@ import SwiftUI
 import SceneKit
 import ModelIO
 import MetalKit
-import CoreImage // 用于图像处理
+import CoreImage
 
-// MARK: - 使用 ARSCNView 的现代化扫描方案 (SceneKit)
+// MARK: - 空间扫描 (SceneKit + LiDAR)
+
+private struct CameraSnapshot {
+    let image: CGImage
+    let cameraTransform: simd_float4x4
+    let fx: Float, fy: Float, cx: Float, cy: Float
+    let imageWidth: Int, imageHeight: Int
+}
+
+// 预计算的快照缓存（避免重复 simd_inverse）
+private struct SnapProjector {
+    let camInverse: simd_float4x4
+    let camPosition: SIMD3<Float>
+    let fx: Float, fy: Float, cx: Float, cy: Float
+    let imgW: Float, imgH: Float
+    let marginX: Float, marginY: Float
+
+    init(_ snap: CameraSnapshot) {
+        camInverse = simd_inverse(snap.cameraTransform)
+        camPosition = SIMD3<Float>(snap.cameraTransform.columns.3.x,
+                                    snap.cameraTransform.columns.3.y,
+                                    snap.cameraTransform.columns.3.z)
+        fx = snap.fx; fy = snap.fy; cx = snap.cx; cy = snap.cy
+        imgW = Float(snap.imageWidth)
+        imgH = Float(snap.imageHeight)
+        marginX = imgW * 0.05
+        marginY = imgH * 0.05
+    }
+
+    /// 投影一个世界坐标点，返回 (pixelX, pixelY) 或 nil（不在有效区域内）
+    func project(_ worldPos: SIMD3<Float>) -> (Float, Float)? {
+        let camPt = simd_mul(camInverse, SIMD4<Float>(worldPos, 1.0))
+        guard camPt.z < -0.1 else { return nil }
+        let z = -camPt.z
+        let px = (camPt.x / z) * fx + cx
+        let py = (camPt.y / z) * fy + cy
+        guard px >= marginX && px < imgW - marginX &&
+              py >= marginY && py < imgH - marginY else { return nil }
+        return (px, py)
+    }
+}
 
 @available(iOS 13.0, *)
 final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate {
     private var sceneView: ARSCNView!
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
-    
+
+    private var globalSnapshots: [CameraSnapshot] = []
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private var lastSnapshotTime: TimeInterval = 0
+    private let snapshotInterval: TimeInterval = 0.3
+    private let maxSnapshots = 50
+
     override init() {
         super.init()
         setupARView()
     }
-    
+
     private func setupARView() {
         sceneView = ARSCNView(frame: .zero)
         sceneView.delegate = self
-        
-        // 自动光照
         sceneView.autoenablesDefaultLighting = true
     }
-    
-    func getSceneView() -> ARSCNView {
-        return sceneView
-    }
-    
+
+    func getSceneView() -> ARSCNView { return sceneView }
+
     func startScanning() {
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) else {
             print("❌ 设备不支持 LiDAR 网格重建")
             return
         }
-        
-        // 清空之前的锚点
         meshAnchors.removeAll()
-        
+        globalSnapshots.removeAll()
+        lastSnapshotTime = 0
+
         let config = ARWorldTrackingConfiguration()
-        config.sceneReconstruction = .mesh
+        config.sceneReconstruction = .meshWithClassification
         config.environmentTexturing = .automatic
-        
-        // 启用平面检测
         config.planeDetection = [.horizontal, .vertical]
-        
-        // 启用场景深度
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
-        
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-        
-        print("✅ 开始扫描（使用 ARSCNView）")
+        print("✅ 开始扫描")
     }
-    
-    // MARK: - ARSCNViewDelegate (可视化网格)
-    
+
+    // MARK: - ARSCNViewDelegate
+
     func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
         guard let meshAnchor = anchor as? ARMeshAnchor else { return nil }
-        
-        // 记录 anchor
         meshAnchors[meshAnchor.identifier] = meshAnchor
-        
-        // 创建用于可视化的简化几何体（不带颜色，高性能）
-        let geometry = createVisualizationGeometry(from: meshAnchor.geometry)
-        
-        let node = SCNNode(geometry: geometry)
-        
-        // 设置统一的材质颜色
-        let material = SCNMaterial()
-        material.diffuse.contents = UIColor.white.withAlphaComponent(0.6) // 半透明白色
-        material.lightingModel = .physicallyBased
-        material.isDoubleSided = true // 确保双面可见
-        
-        // 可选：添加线框效果让结构更清晰
-        // material.fillMode = .lines 
-        
-        geometry.materials = [material]
-        
+        let geo = createVisualizationGeometry(from: meshAnchor.geometry)
+        let node = SCNNode(geometry: geo)
+        let mat = SCNMaterial()
+        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.6)
+        mat.lightingModel = .physicallyBased
+        mat.isDoubleSided = true
+        geo.materials = [mat]
         return node
     }
 
-        
-
-    
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
         guard let meshAnchor = anchor as? ARMeshAnchor else { return }
-        
-        // 更新 anchor 状态
         meshAnchors[meshAnchor.identifier] = meshAnchor
-        
-        // 更新几何体
-        // 直接创建新的 SCNGeometry 并替换
-        // 直接创建新的 SCNGeometry 并替换
-        // 这是一个高效的操作，因为 buffer 是共享的 Metal buffer
-        let newGeometry = createVisualizationGeometry(from: meshAnchor.geometry)
-        
-        // 保持原来的材质
-        let materials = node.geometry?.materials ?? []
-        newGeometry.materials = materials
-        
-        // 如果没有材质（首次 update？），则重新创建
-        if newGeometry.materials.isEmpty {
-            let material = SCNMaterial()
-            material.diffuse.contents = UIColor.white.withAlphaComponent(0.6)
-            material.lightingModel = .physicallyBased
-            material.isDoubleSided = true
-            newGeometry.materials = [material]
+        let newGeo = createVisualizationGeometry(from: meshAnchor.geometry)
+        newGeo.materials = node.geometry?.materials ?? []
+        if newGeo.materials.isEmpty {
+            let mat = SCNMaterial()
+            mat.diffuse.contents = UIColor.white.withAlphaComponent(0.6)
+            mat.lightingModel = .physicallyBased; mat.isDoubleSided = true
+            newGeo.materials = [mat]
         }
-        
-        node.geometry = newGeometry
+        node.geometry = newGeo
     }
-    
-    func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
-        if let meshAnchor = anchor as? ARMeshAnchor {
-            // 不要移除已经扫描到的网格，即使用户移动视角导致其不可见
-            // 我们希望保留所有数据用于导出
-            // meshAnchors.removeValue(forKey: meshAnchor.identifier)
-            print("⚠️ 系统尝试移除网格: \(meshAnchor.identifier)，已拦截保留")
+
+    func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {}
+
+    // 定期保存全分辨率相机快照
+    func renderer(_ renderer: SCNSceneRenderer, willRenderScene scene: SCNScene, atTime time: TimeInterval) {
+        guard time - lastSnapshotTime >= snapshotInterval else { return }
+        guard let frame = sceneView.session.currentFrame else { return }
+        captureSnapshot(from: frame)
+        lastSnapshotTime = time
+    }
+
+    private func captureSnapshot(from frame: ARFrame) {
+        let pixelBuffer = frame.capturedImage
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+
+        let intrinsics = frame.camera.intrinsics
+        let snap = CameraSnapshot(
+            image: cgImage,
+            cameraTransform: frame.camera.transform,
+            fx: intrinsics[0][0], fy: intrinsics[1][1],
+            cx: intrinsics[2][0], cy: intrinsics[2][1],
+            imageWidth: cgImage.width, imageHeight: cgImage.height
+        )
+        if globalSnapshots.count >= maxSnapshots {
+            globalSnapshots.removeFirst()
+        }
+        globalSnapshots.append(snap)
+    }
+
+    // MARK: - 可视化几何体（实时预览用，轻量）
+
+    private func createVisualizationGeometry(from mesh: ARMeshGeometry) -> SCNGeometry {
+        let vSrc = SCNGeometrySource(buffer: mesh.vertices.buffer, vertexFormat: mesh.vertices.format,
+                                      semantic: .vertex, vertexCount: mesh.vertices.count,
+                                      dataOffset: mesh.vertices.offset, dataStride: mesh.vertices.stride)
+        let nSrc = SCNGeometrySource(buffer: mesh.normals.buffer, vertexFormat: mesh.normals.format,
+                                      semantic: .normal, vertexCount: mesh.normals.count,
+                                      dataOffset: mesh.normals.offset, dataStride: mesh.normals.stride)
+        let fData = Data(bytes: mesh.faces.buffer.contents(), count: mesh.faces.buffer.length)
+        let elem = SCNGeometryElement(data: fData, primitiveType: .triangles,
+                                       primitiveCount: mesh.faces.count, bytesPerIndex: mesh.faces.bytesPerIndex)
+        return SCNGeometry(sources: [vSrc, nSrc], elements: [elem])
+    }
+
+    // MARK: - 导出
+
+    func stopScanningAndExport() -> URL? {
+        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let fileURL = documentsURL.appendingPathComponent("scan_\(Date().timeIntervalSince1970).usdc")
+
+        guard let frame = sceneView.session.currentFrame else {
+            print("❌ 无法获取当前帧"); return nil
+        }
+        captureSnapshot(from: frame)
+
+        let anchors = Array(meshAnchors.values)
+        let snapshots = globalSnapshots
+        sceneView.session.pause()
+
+        print("📋 导出: \(anchors.count) 个网格, \(snapshots.count) 个快照")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try self.exportScene(to: fileURL, anchors: anchors, snapshots: snapshots)
+                DispatchQueue.main.async {
+                    ObjectScannerPlugin.pendingResult?(["path": fileURL.path, "msg": "success"])
+                }
+            } catch {
+                print("❌ 导出失败: \(error)")
+                DispatchQueue.main.async {
+                    ObjectScannerPlugin.pendingResult?(["path": "", "msg": "导出失败: \(error.localizedDescription)"])
+                }
+            }
+        }
+        return fileURL
+    }
+
+    private func exportScene(to url: URL, anchors: [ARMeshAnchor], snapshots: [CameraSnapshot]) throws {
+        guard #available(iOS 14.0, *) else {
+            throw NSError(domain: "SpaceScanner", code: 2, userInfo: [NSLocalizedDescriptionKey: "需要 iOS 14.0+"])
+        }
+        guard !anchors.isEmpty else {
+            throw NSError(domain: "SpaceScanner", code: 1, userInfo: [NSLocalizedDescriptionKey: "没有网格数据"])
+        }
+
+        // 预计算所有快照的投影器（只算一次 simd_inverse）
+        let projectors = snapshots.map { SnapProjector($0) }
+
+        let scene = SCNScene()
+        let rootNode = SCNNode()
+        rootNode.name = "RootNode"
+
+        var totalTexturedFaces = 0
+        var totalGrayFaces = 0
+
+        for meshAnchor in anchors {
+            let node = createTexturedNode(from: meshAnchor, snapshots: snapshots, projectors: projectors,
+                                           texturedFaces: &totalTexturedFaces, grayFaces: &totalGrayFaces)
+            rootNode.addChildNode(node)
+        }
+
+        scene.rootNode.addChildNode(rootNode)
+
+        let light = SCNNode()
+        light.light = SCNLight()
+        light.light!.type = .ambient
+        light.light!.color = UIColor.white
+        light.light!.intensity = 1000
+        scene.rootNode.addChildNode(light)
+
+        print("📦 有纹理: \(totalTexturedFaces) 面, 无纹理: \(totalGrayFaces) 面")
+
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: url)
+
+        guard scene.write(to: url, options: [:], delegate: nil, progressHandler: nil) else {
+            throw NSError(domain: "SpaceScanner", code: 5, userInfo: [NSLocalizedDescriptionKey: "导出失败"])
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw NSError(domain: "SpaceScanner", code: 3, userInfo: [NSLocalizedDescriptionKey: "文件不存在"])
+        }
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int64 {
+            print("✅ 导出完成: \(String(format: "%.2f", Double(size)/1024/1024)) MB")
         }
     }
 
-    // 创建轻量级可视化几何体 (仅顶点和索引)
-    private func createVisualizationGeometry(from mesh: ARMeshGeometry) -> SCNGeometry {
-        let vertices = mesh.vertices
-        
-        let vertexSource = SCNGeometrySource(buffer: vertices.buffer,
-                                             vertexFormat: vertices.format,
-                                             semantic: .vertex,
-                                             vertexCount: vertices.count,
-                                             dataOffset: vertices.offset,
-                                             dataStride: vertices.stride)
-        
-        let normals = mesh.normals
-        let normalSource = SCNGeometrySource(buffer: normals.buffer,
-                                             vertexFormat: normals.format,
-                                             semantic: .normal,
-                                             vertexCount: normals.count,
-                                             dataOffset: normals.offset,
-                                             dataStride: normals.stride)
-        
-        let faces = mesh.faces
-        let facesData = Data(bytes: faces.buffer.contents(), count: faces.buffer.length)
-        
-        let element = SCNGeometryElement(data: facesData,
-                                         primitiveType: .triangles,
-                                         primitiveCount: faces.count,
-                                         bytesPerIndex: faces.bytesPerIndex)
-        
-        return SCNGeometry(sources: [vertexSource, normalSource], elements: [element])
-    }
-    
-    func stopScanningAndExport() -> URL? {
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        // 改为 .usdc 格式，MDLAsset 可以直接导出，且兼容 iOS 查看
-        let fileURL = documentsURL.appendingPathComponent("scan_\(Date().timeIntervalSince1970).usdc")
-        
-        // 1. 在主线程立即捕获所有状态
-        guard let currentFrame = sceneView.session.currentFrame else {
-            print("❌ 无法获取当前帧")
-            return nil
-        }
-        
-        // 关键修复：直接使用自己维护的 meshAnchors 列表
-        // ARFrame.anchors 可能不完整或被剔除，但我们希望导出所有扫描过的区域
-        // 并过滤掉那些已经被系统标记为 remove 的（已经通过 didRemove 处理）
-        let anchors = Array(self.meshAnchors.values)
-        
-        sceneView.session.pause()
-        
-        print("📋 准备导出场景，共捕获 \(anchors.count) 个网格块")
-        
-        // 2. 在后台导出 (传入捕获到的锚点列表)
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                // 使用 RealityKit 导出场景
-                try self.exportSceneToUSDZ(to: fileURL, anchors: anchors, frame: currentFrame)
-                
-                DispatchQueue.main.async {
-                    ObjectScannerPlugin.pendingResult?([
-                        "path": fileURL.path,
-                        "msg": "success"
-                    ])
-                }
-            } catch {
-                print("❌ 导出失败: \(error)")
-                DispatchQueue.main.async {
-                    ObjectScannerPlugin.pendingResult?([
-                        "path": "",
-                        "msg": "导出失败: \(error.localizedDescription)"
-                    ])
-                }
-            }
-        }
-        
-        return fileURL
-    }
-    
-    private func exportSceneToUSDZ(to url: URL, anchors: [ARMeshAnchor], frame: ARFrame) throws {
-        if #available(iOS 14.0, *) {
-            print("📊 开始导出场景...")
-            
-            guard !anchors.isEmpty else {
-                throw NSError(domain: "SpaceScanner", code: 1, 
-                            userInfo: [NSLocalizedDescriptionKey: "没有捕获到网格数据，请确保设备支持LiDAR并移动设备扫描物体"])
-            }
-            
-            // 使用 SceneKit 创建场景
-            let scene = SCNScene()
-            let rootNode = SCNNode()
-            rootNode.name = "RootNode"
-            
-            var totalVertices = 0
-            var totalFaces = 0
-            
-            // 准备纹理图像
-            var textureImage: UIImage?
-            var cameraTransform: simd_float4x4?
-            var cameraIntrinsics: simd_float3x3?
-            var imageResolution: CGSize = .zero
-            
-            // 处理纹理数据
-            let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
-            let context = CIContext()
-            if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
-                textureImage = UIImage(cgImage: cgImage)
-            }
-            
-            cameraTransform = frame.camera.transform
-            cameraIntrinsics = frame.camera.intrinsics
-            imageResolution = CGSize(
-                width: CVPixelBufferGetWidth(frame.capturedImage),
-                height: CVPixelBufferGetHeight(frame.capturedImage)
-            )
-            
-            // 为每个网格创建 SCNNode
-            for meshAnchor in anchors {
-                let mesh = meshAnchor.geometry
-                let vertexCount = mesh.vertices.count
-                let faceCount = mesh.faces.count
-                
-                totalVertices += vertexCount
-                totalFaces += faceCount
-                
-                // 创建 SCNGeometry（带 UV 坐标）
-                let geometry = createSCNGeometry(
-                    from: meshAnchor, 
-                    cameraTransform: cameraTransform,
-                    cameraIntrinsics: cameraIntrinsics,
-                    imageResolution: imageResolution
-                )
-                
-                // 创建材质
-                let material = SCNMaterial()
-                material.lightingModel = .physicallyBased 
-                material.isDoubleSided = true
-                
-                // 设置纹理
-                if let texture = textureImage {
-                    material.diffuse.contents = texture
-                } else {
-                    material.diffuse.contents = UIColor.lightGray
-                }
-                
-                // 设置材质属性
-                material.metalness.contents = 0.0
-                material.roughness.contents = 1.0 
-                
-                // 关键修正：将材质直接赋值给 SCNNode 而不是 SCNGeometry
-                // 有时候 SceneKit/ModelIO 导出时，Geometry 级别的材质可能会被忽略或处理不当
-                // 或者确保 Geometry 的 materials 数组被正确设置
-                geometry.materials = [material] 
-                
-                // 创建节点
-                let node = SCNNode(geometry: geometry)
-                node.name = "Mesh_\(meshAnchor.identifier.uuidString.prefix(8))"
-                // 确保节点也持有该材质（双重保险）
-                node.geometry?.materials = [material]
-                
-                rootNode.addChildNode(node)
-            }
-            
-            scene.rootNode.addChildNode(rootNode)
-            
-            // 添加环境光
-            let ambientLight = SCNNode()
-            ambientLight.light = SCNLight()
-            ambientLight.light!.type = .ambient
-            ambientLight.light!.color = UIColor.white
-            ambientLight.light!.intensity = 1000
-            scene.rootNode.addChildNode(ambientLight)
-            
-            print("📦 总计: \(totalVertices) 顶点, \(totalFaces) 面")
-            print("📦 场景节点数: \(rootNode.childNodes.count)")
-            print("💾 导出 USDZ 文件到: \(url.path)")
-            
-            // 确保目录存在
-            let directory = url.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
-            
-            // 删除已存在的文件
-            try? FileManager.default.removeItem(at: url)
-            
-            // 使用 ModelIO 导出 USDC (支持纹理)
-            let mdlAsset = MDLAsset(scnScene: scene)
-            
-            // 关键：确保 ModelIO 知道要打包纹理
-            // 有时直接 export 可能会丢失 external textures
-            // 这里我们尝试将 texture 写入文件系统，然后让 MDLAsset 引用它
-            // 或者使用 SceneKit 的 write(to:options:)
-            
-            // 尝试使用 SceneKit 直接导出，SceneKit 对 USDZ 的支持可能比 MDLAsset 的默认导出更完整
-            // 特别是内嵌纹理
-             do {
-                // SCNScene 的 write 方法在处理内嵌纹理方面通常更可靠
-                // .checkConsistency = true 可以帮我们发现问题
-                 let success = scene.write(to: url, options: [:], delegate: nil, progressHandler: nil)
-                 if !success {
-                     throw NSError(domain: "SpaceScanner", code: 5, userInfo: [NSLocalizedDescriptionKey: "SceneKit write failed"])
-                 }
-                 
-                // 验证文件
-                let fileExists = FileManager.default.fileExists(atPath: url.path)
-                print("✅ SceneKit 导出完成")
-                print("   文件路径: \(url.path)")
-                print("   文件存在: \(fileExists)")
-                
-                if fileExists {
-                    if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-                       let fileSize = attributes[.size] as? Int64 {
-                        let sizeMB = Double(fileSize) / 1024.0 / 1024.0
-                        print("   文件大小: \(fileSize) 字节 (\(String(format: "%.2f", sizeMB)) MB)")
-                        
-                        if fileSize < 1000 {
-                            print("⚠️ 警告：文件太小(\(fileSize)字节)，可能为空")
-                            throw NSError(domain: "SpaceScanner", code: 4, 
-                                        userInfo: [NSLocalizedDescriptionKey: "导出的文件太小，可能没有包含有效数据"])
-                        }
-                    }
-                } else {
-                    throw NSError(domain: "SpaceScanner", code: 3, 
-                                userInfo: [NSLocalizedDescriptionKey: "文件导出后不存在"])
-                }
-            } catch {
-                print("❌ 导出失败: \(error)")
-                print("   错误详情: \(error.localizedDescription)")
-                throw error
-            }
-        } else {
-            throw NSError(domain: "SpaceScanner", code: 2, 
-                        userInfo: [NSLocalizedDescriptionKey: "需要 iOS 14.0 或更高版本"])
-        }
-    }
-    
+    // MARK: - 核心：为每个面搜索全部快照，选最佳的
+
     @available(iOS 14.0, *)
-    private func createSCNGeometry(
-        from meshAnchor: ARMeshAnchor,
-        cameraTransform: simd_float4x4?,
-        cameraIntrinsics: simd_float3x3?,
-        imageResolution: CGSize
-    ) -> SCNGeometry {
+    private func createTexturedNode(from meshAnchor: ARMeshAnchor, snapshots: [CameraSnapshot],
+                                     projectors: [SnapProjector],
+                                     texturedFaces: inout Int, grayFaces: inout Int) -> SCNNode {
         let mesh = meshAnchor.geometry
         let transform = meshAnchor.transform
-        
         let vertexCount = mesh.vertices.count
-        let vertexBuffer = mesh.vertices.buffer
-        let vertexOffset = mesh.vertices.offset
-        let vertexStride = mesh.vertices.stride
-        
-        var transformedVertices: [SCNVector3] = []
-        var transformedNormals: [SCNVector3] = []
-        var textureCoordinates: [CGPoint] = [] // 改用纹理坐标
-        var indices: [UInt32] = []
-        
-        // 预分配内存
-        transformedVertices.reserveCapacity(vertexCount)
-        transformedNormals.reserveCapacity(vertexCount)
-        textureCoordinates.reserveCapacity(vertexCount)
-        
-        // 1. 处理顶点和 UV 坐标
-        let basePointer = vertexBuffer.contents().advanced(by: vertexOffset)
-        
-        for i in 0..<vertexCount {
-            let vertexPointer = basePointer.advanced(by: i * vertexStride)
-            let vertex = vertexPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            
-            // 变换到世界坐标
-            let worldVertex = transform * SIMD4<Float>(vertex, 1.0)
-            let worldPos = SIMD3<Float>(worldVertex.x, worldVertex.y, worldVertex.z)
-            transformedVertices.append(SCNVector3(worldPos.x, worldPos.y, worldPos.z))
-            
-            // 计算纹理坐标 (UV)
-            var uv = CGPoint.zero
-            
-            if let camTransform = cameraTransform,
-               let camIntrinsics = cameraIntrinsics {
-                
-                // 世界坐标 -> 相机坐标
-                let cameraSpacePoint = simd_mul(simd_inverse(camTransform), SIMD4<Float>(worldPos, 1.0))
-                
-                // 点必须在相机前方 (Z < 0)
-                if cameraSpacePoint.z < 0 {
-                    // 投影到归一化图像平面
-                    let z = -cameraSpacePoint.z
-                    let x = cameraSpacePoint.x / z
-                    let y = cameraSpacePoint.y / z
-                    
-                    // 应用相机内参矩阵投影到像素坐标
-                    let fx = camIntrinsics[0][0]
-                    let fy = camIntrinsics[1][1]
-                    let cx = camIntrinsics[2][0]
-                    let cy = camIntrinsics[2][1]
-                    
-                    let pixelX = x * fx + cx
-                    let pixelY = y * fy + cy
-                    
-                    // 归一化到 [0, 1] 范围作为 UV
-                    // 注意：Metal/SceneKit 的纹理坐标系 (0,0) 通常在左下角，而图像像素 (0,0) 在左上角
-                    // 需要反转 Y 轴: 1.0 - (pixelY / height)
-                    let u = CGFloat(pixelX) / imageResolution.width
-                    let v = 1.0 - (CGFloat(pixelY) / imageResolution.height)
-                    
-                    uv = CGPoint(x: u, y: v)
-                }
-            }
-            textureCoordinates.append(uv)
-        }
-        
-        // 2. 处理法线
-        let normalCount = mesh.normals.count
-        let normalBuffer = mesh.normals.buffer
-        let normalOffset = mesh.normals.offset
-        let normalStride = mesh.normals.stride
-        let normalBasePointer = normalBuffer.contents().advanced(by: normalOffset)
-        
+
         let rotation = simd_float3x3(
             SIMD3<Float>(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z),
             SIMD3<Float>(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z),
             SIMD3<Float>(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
         )
-        
-        for i in 0..<normalCount {
-            let normalPointer = normalBasePointer.advanced(by: i * normalStride)
-            let normal = normalPointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            let worldNormal = rotation * normal
-            transformedNormals.append(SCNVector3(worldNormal.x, worldNormal.y, worldNormal.z))
+
+        // 1) 提取世界坐标
+        var worldVerts = [SIMD3<Float>]()
+        var worldNormals = [SIMD3<Float>]()
+        worldVerts.reserveCapacity(vertexCount)
+        worldNormals.reserveCapacity(vertexCount)
+
+        let vBase = mesh.vertices.buffer.contents().advanced(by: mesh.vertices.offset)
+        let nBase = mesh.normals.buffer.contents().advanced(by: mesh.normals.offset)
+        for i in 0..<vertexCount {
+            let v = vBase.advanced(by: i * mesh.vertices.stride).assumingMemoryBound(to: SIMD3<Float>.self).pointee
+            let w = transform * SIMD4<Float>(v, 1.0)
+            worldVerts.append(SIMD3<Float>(w.x, w.y, w.z))
+            let n = nBase.advanced(by: i * mesh.normals.stride).assumingMemoryBound(to: SIMD3<Float>.self).pointee
+            worldNormals.append(rotation * n)
         }
-        
-        // 3. 处理索引
-        let facesCount = mesh.faces.count
-        let facesBuffer = mesh.faces.buffer
-        let bytesPerIndex = mesh.faces.bytesPerIndex
-        let facesBasePointer = facesBuffer.contents()
-        
-        indices.reserveCapacity(facesCount * 3)
-        if bytesPerIndex == 2 {
-            let p = facesBasePointer.assumingMemoryBound(to: UInt16.self)
-            for i in 0..<(facesCount * 3) { indices.append(UInt32(p[i])) }
+
+        // 2) 提取索引
+        var origIndices = [UInt32]()
+        let faceCount = mesh.faces.count
+        let fBase = mesh.faces.buffer.contents()
+        origIndices.reserveCapacity(faceCount * 3)
+        if mesh.faces.bytesPerIndex == 2 {
+            let p = fBase.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<(faceCount * 3) { origIndices.append(UInt32(p[i])) }
         } else {
-            let p = facesBasePointer.assumingMemoryBound(to: UInt32.self)
-            for i in 0..<(facesCount * 3) { indices.append(p[i]) }
+            let p = fBase.assumingMemoryBound(to: UInt32.self)
+            for i in 0..<(faceCount * 3) { origIndices.append(p[i]) }
         }
-        
-        // 4. 构建 SCNGeometrySource
-        let vertexSource = SCNGeometrySource(vertices: transformedVertices)
-        let normalSource = SCNGeometrySource(normals: transformedNormals)
-        let texcoordSource = SCNGeometrySource(textureCoordinates: textureCoordinates) // 新增 UV Source
-        
-        let element = SCNGeometryElement(indices: indices, primitiveType: .triangles)
-        
-        return SCNGeometry(sources: [vertexSource, normalSource, texcoordSource], elements: [element])
+
+        // 3) 对每个面搜索全部快照，选最佳（要求 3 个顶点全部可见）
+        //    faceAssignment[f] = 快照索引，-1 表示无合适快照
+        var faceAssignment = [Int](repeating: -1, count: faceCount)
+
+        for f in 0..<faceCount {
+            let i0 = Int(origIndices[f * 3])
+            let i1 = Int(origIndices[f * 3 + 1])
+            let i2 = Int(origIndices[f * 3 + 2])
+
+            let wp0 = worldVerts[i0]
+            let wp1 = worldVerts[i1]
+            let wp2 = worldVerts[i2]
+
+            // 面法线
+            let edge1 = wp1 - wp0
+            let edge2 = wp2 - wp0
+            let crossProduct = simd_cross(edge1, edge2)
+            let len = simd_length(crossProduct)
+            guard len > 1e-8 else { continue } // 退化三角形
+            let faceNormal = crossProduct / len
+            let faceCenter = (wp0 + wp1 + wp2) / 3.0
+
+            var bestSnapIdx = -1
+            var bestScore: Float = 0
+
+            for si in 0..<projectors.count {
+                let proj = projectors[si]
+
+                // 法线朝向检查：面必须朝向相机
+                let viewDir = simd_normalize(proj.camPosition - faceCenter)
+                let facing = simd_dot(faceNormal, viewDir)
+                if facing < 0.2 { continue } // 太斜，跳过
+
+                // 3 个顶点必须全部在图像有效区域内
+                guard let p0 = proj.project(wp0),
+                      let p1 = proj.project(wp1),
+                      let p2 = proj.project(wp2) else { continue }
+
+                // 计算居中程度（越靠中心畸变越小）
+                let halfW = proj.imgW * 0.5
+                let halfH = proj.imgH * 0.5
+                var centerScore: Float = 0
+                for (px, py) in [p0, p1, p2] {
+                    let dx = (px - halfW) / halfW
+                    let dy = (py - halfH) / halfH
+                    centerScore += 1.0 - sqrt(dx * dx + dy * dy) * 0.5
+                }
+                centerScore /= 3.0
+
+                let score = facing * centerScore
+                if score > bestScore {
+                    bestScore = score
+                    bestSnapIdx = si
+                }
+            }
+
+            faceAssignment[f] = bestSnapIdx
+        }
+
+        // 4) 按快照分组
+        var snapFaces = [Int: [Int]]()  // snapIndex -> [faceIndex]
+        var grayFaceList = [Int]()
+
+        for f in 0..<faceCount {
+            let si = faceAssignment[f]
+            if si >= 0 {
+                snapFaces[si, default: []].append(f)
+            } else {
+                grayFaceList.append(f)
+            }
+        }
+
+        // 5) 构建几何体：每个快照一个 element + material
+        var allVerts = [SCNVector3]()
+        var allNormals = [SCNVector3]()
+        var allUVs = [CGPoint]()
+        var elements = [SCNGeometryElement]()
+        var materials = [SCNMaterial]()
+
+        // 有纹理的面
+        for (si, faces) in snapFaces {
+            let snap = snapshots[si]
+            let proj = projectors[si]
+
+            var groupIndices = [UInt32]()
+            groupIndices.reserveCapacity(faces.count * 3)
+
+            for f in faces {
+                let vertBase = UInt32(allVerts.count)
+                for k in 0..<3 {
+                    let vi = Int(origIndices[f * 3 + k])
+                    let wp = worldVerts[vi]
+                    let wn = worldNormals[vi]
+                    allVerts.append(SCNVector3(wp.x, wp.y, wp.z))
+                    allNormals.append(SCNVector3(wn.x, wn.y, wn.z))
+
+                    // 投影 UV（这里一定能投影成功，因为 faceAssignment 已验证）
+                    if let (px, py) = proj.project(wp) {
+                        let u = CGFloat(px / proj.imgW)
+                        let v = CGFloat(1.0 - py / proj.imgH)
+                        allUVs.append(CGPoint(x: u, y: v))
+                    } else {
+                        allUVs.append(CGPoint(x: 0.5, y: 0.5))
+                    }
+                }
+                groupIndices.append(vertBase)
+                groupIndices.append(vertBase + 1)
+                groupIndices.append(vertBase + 2)
+            }
+
+            elements.append(SCNGeometryElement(indices: groupIndices, primitiveType: .triangles))
+
+            let mat = SCNMaterial()
+            mat.lightingModel = .physicallyBased
+            mat.isDoubleSided = true
+            mat.metalness.contents = 0.0
+            mat.roughness.contents = 1.0
+            mat.diffuse.contents = UIImage(cgImage: snap.image)
+            mat.diffuse.wrapS = .clamp
+            mat.diffuse.wrapT = .clamp
+            materials.append(mat)
+
+            texturedFaces += faces.count
+        }
+
+        // 无纹理的面（灰色）
+        if !grayFaceList.isEmpty {
+            var grayIndices = [UInt32]()
+            grayIndices.reserveCapacity(grayFaceList.count * 3)
+
+            for f in grayFaceList {
+                let vertBase = UInt32(allVerts.count)
+                for k in 0..<3 {
+                    let vi = Int(origIndices[f * 3 + k])
+                    let wp = worldVerts[vi]
+                    let wn = worldNormals[vi]
+                    allVerts.append(SCNVector3(wp.x, wp.y, wp.z))
+                    allNormals.append(SCNVector3(wn.x, wn.y, wn.z))
+                    allUVs.append(CGPoint(x: 0, y: 0))
+                }
+                grayIndices.append(vertBase)
+                grayIndices.append(vertBase + 1)
+                grayIndices.append(vertBase + 2)
+            }
+
+            elements.append(SCNGeometryElement(indices: grayIndices, primitiveType: .triangles))
+
+            let mat = SCNMaterial()
+            mat.lightingModel = .physicallyBased
+            mat.isDoubleSided = true
+            mat.diffuse.contents = UIColor(white: 0.75, alpha: 1.0)
+            materials.append(mat)
+
+            grayFaces += grayFaceList.count
+        }
+
+        guard !elements.isEmpty else {
+            let node = SCNNode(geometry: SCNGeometry())
+            return node
+        }
+
+        let geo = SCNGeometry(
+            sources: [
+                SCNGeometrySource(vertices: allVerts),
+                SCNGeometrySource(normals: allNormals),
+                SCNGeometrySource(textureCoordinates: allUVs)
+            ],
+            elements: elements
+        )
+        geo.materials = materials
+
+        let node = SCNNode(geometry: geo)
+        node.name = "Mesh_\(meshAnchor.identifier.uuidString.prefix(8))"
+        return node
     }
 }
 
@@ -481,15 +477,13 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
 struct SpaceScanView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var viewModel = SpaceScannerViewModel()
-    
+
     var body: some View {
         ZStack(alignment: .bottom) {
             ARViewContainer(sceneView: viewModel.getSceneView())
                 .ignoresSafeArea()
-                .onAppear {
-                    viewModel.startScanning()
-                }
-            
+                .onAppear { viewModel.startScanning() }
+
             VStack(spacing: 12) {
                 Text(L10n.moveToScan)
                     .font(.headline)
@@ -499,9 +493,7 @@ struct SpaceScanView: View {
                     .cornerRadius(8)
 
                 Button(action: {
-                    if let _ = viewModel.stopScanningAndExport() {
-                        dismiss()
-                    }
+                    if let _ = viewModel.stopScanningAndExport() { dismiss() }
                 }) {
                     Text(L10n.stopAndExport)
                         .font(.headline)
@@ -520,10 +512,6 @@ struct SpaceScanView: View {
 @available(iOS 14.0, *)
 struct ARViewContainer: UIViewRepresentable {
     let sceneView: ARSCNView
-    
-    func makeUIView(context: Context) -> ARSCNView {
-        return sceneView
-    }
-    
+    func makeUIView(context: Context) -> ARSCNView { return sceneView }
     func updateUIView(_ uiView: ARSCNView, context: Context) {}
 }
