@@ -104,9 +104,20 @@ class RoomController: NSObject, ObservableObject, RoomCaptureViewDelegate, NSCod
     func stopSession() {
         print("🛑 停止扫描会话")
         captureView.captureSession.stop()
-        
+
         DispatchQueue.main.async {
             self.scanningProgress = "正在处理扫描结果..."
+        }
+    }
+
+    func stopAndRelease() {
+        print("🛑 停止并释放相机资源")
+        if isScanning {
+            captureView.captureSession.stop()
+        }
+        DispatchQueue.main.async {
+            self.isScanning = false
+            self.scanningProgress = ""
         }
     }
     
@@ -231,8 +242,8 @@ struct RoomScannerView: View {
             HStack(spacing: 20) {
                 if roomController.isScanning {
                     Button(L10n.doneScan) {
-                        dismiss()
                         roomController.stopSession()
+                        dismiss()
                     }
                     .font(.headline)
                     .foregroundColor(.white)
@@ -276,12 +287,12 @@ struct RoomScannerView: View {
         HStack{
             
             Button(L10n.close){
+                roomController.stopAndRelease()
                 dismiss()
                 ObjectScannerPlugin.pendingResult?([
                     "path":"",
                     "msg":"关闭扫描界面"
                 ])
-                // ⚠️ 一定要清空，防止重复调用
                 ObjectScannerPlugin.pendingResult = nil
             }
             .glassIfAvailable()
