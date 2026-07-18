@@ -198,6 +198,13 @@ class Model: ObservableObject {
                 }
                 for mat in geo.materials { mat.isDoubleSided = true }
             }
+
+            for material in geo.materials {
+                material.diffuse.magnificationFilter = .linear
+                material.diffuse.minificationFilter = .linear
+                material.diffuse.mipFilter = .linear
+                material.diffuse.maxAnisotropy = 8
+            }
         }
         for child in node.childNodes { fixMaterials(child, ext: ext) }
     }
@@ -221,6 +228,7 @@ struct SceneView: UIViewRepresentable {
         let view = SCNView()
         view.autoenablesDefaultLighting = true
         view.allowsCameraControl = true
+        view.antialiasingMode = .multisampling4X
         view.scene = scene
         view.backgroundColor = UIColor(red: 10/255, green: 12/255, blue: 24/255, alpha: 1)
 
