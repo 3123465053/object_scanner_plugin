@@ -68,89 +68,71 @@ class Model: ObservableObject {
 
     // MARK: - OBJ 纹理手动加载
 
-    /// 直接从目录中找纹理文件赋给 SCNMaterial，完全不依赖 MDLAsset 的纹理加载。
-    ///
-    /// 方案说明：
-    ///   - 方案A（按名称）：解析 MTL → textureMap[matName]=image → 按 mat.name 匹配
-    ///     问题：MDLAsset→SCNScene 转换后 mat.name 常为 nil，导致全部匹配失败
-    ///   - 方案B（按文件名规律，本方案）：
-    ///     我们自己生成的 OBJ 纹理命名固定为 <baseName>_tex0.jpg / _tex1.jpg ...
-    ///     直接扫描这些文件，按顺序赋给场景中所有材质，不依赖材质名称
+    /// 按 MTL 的 newmtl → map_Kd 映射恢复 OBJ 材质。
     private static func applyOBJTextures(scene: SCNScene, objURL: URL) {
-        let dir      = objURL.deletingLastPathComponent()
-        let baseName = objURL.deletingPathExtension().lastPathComponent
-
-        // ── 1. 按命名规律收集纹理（_tex0.jpg, _tex1.jpg, ...）──
-        var textures: [UIImage] = []
-        var idx = 0
-        while true {
-            let jpg = dir.appendingPathComponent("\(baseName)_tex\(idx).jpg").path
-            let png = dir.appendingPathComponent("\(baseName)_tex\(idx).png").path
-            if let img = UIImage(contentsOfFile: jpg) ?? UIImage(contentsOfFile: png) {
-                textures.append(img)
-                idx += 1
-            } else {
-                break
-            }
-        }
-
-        // 方案B 找不到时降级方案A：解析 MTL 获取任意纹理
-        if textures.isEmpty {
-            textures = loadTexturesFromMTL(dir: dir, objURL: objURL)
-        }
-
-        guard !textures.isEmpty else {
-            print("OBJ 预览：未找到纹理文件，dir=\(dir.path)")
+        let directory = objURL.deletingLastPathComponent()
+        let mtlURL = directory.appendingPathComponent(
+            objURL.deletingPathExtension().lastPathComponent + ".mtl"
+        )
+        guard let contents = try? String(contentsOf: mtlURL, encoding: .utf8) else {
+            print("OBJ 预览：无法读取 MTL，path=\(mtlURL.path)")
             return
         }
 
-        // ── 2. 收集场景所有材质 ──
+        var texturePaths: [String: String] = [:]
+        var currentMaterial: String?
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("newmtl ") {
+                currentMaterial = String(trimmed.dropFirst(7))
+                    .trimmingCharacters(in: .whitespaces)
+            } else if trimmed.lowercased().hasPrefix("map_kd "),
+                      let materialName = currentMaterial {
+                let relativePath = String(trimmed.dropFirst(7))
+                    .trimmingCharacters(in: .whitespaces)
+                if !relativePath.isEmpty {
+                    texturePaths[materialName] = relativePath
+                }
+            }
+        }
+
+        guard !texturePaths.isEmpty else {
+            print("OBJ 预览：MTL 中没有 map_Kd")
+            return
+        }
+
         var allMaterials: [SCNMaterial] = []
         scene.rootNode.enumerateHierarchy { node, _ in
             allMaterials.append(contentsOf: node.geometry?.materials ?? [])
         }
 
-        // ── 3. 赋值：只有一种纹理时全部用同一张，多种时按索引循环 ──
-        let single = textures[0]
-        for (i, mat) in allMaterials.enumerated() {
-            mat.diffuse.contents = textures.count == 1 ? single : textures[i % textures.count]
-            mat.isDoubleSided   = true
-        }
-        print("OBJ 预览：赋纹理 \(textures.count) 张 → \(allMaterials.count) 个材质")
-    }
-
-    /// 降级方案：解析 MTL 文件收集所有 map_Kd 引用的图片（去重）
-    private static func loadTexturesFromMTL(dir: URL, objURL: URL) -> [UIImage] {
-        guard let fh = try? FileHandle(forReadingFrom: objURL) else { return [] }
-        let header = fh.readData(ofLength: 4096); fh.closeFile()
-        guard let headerStr = String(data: header, encoding: .utf8) else { return [] }
-
-        var mtlFileName: String? = nil
-        for line in headerStr.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            if t.lowercased().hasPrefix("mtllib ") {
-                mtlFileName = String(t.dropFirst(7)).trimmingCharacters(in: .whitespaces)
-                break
+        var imageCache: [String: UIImage] = [:]
+        var assignedCount = 0
+        for (index, material) in allMaterials.enumerated() {
+            let generatedName = "mat_\(index)"
+            let materialName = material.name.flatMap { texturePaths[$0] == nil ? nil : $0 }
+                ?? (texturePaths[generatedName] == nil ? nil : generatedName)
+            guard let materialName,
+                  let relativePath = texturePaths[materialName] else {
+                material.isDoubleSided = true
+                continue
             }
-        }
-        guard let mtlFile = mtlFileName,
-              let mtlStr = try? String(contentsOf: dir.appendingPathComponent(mtlFile),
-                                       encoding: .utf8) else { return [] }
 
-        var result: [UIImage] = []
-        var seen = Set<String>()
-        for line in mtlStr.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            guard t.lowercased().hasPrefix("map_kd "),
-                  let texFile = t.components(separatedBy: .whitespaces).last,
-                  !texFile.isEmpty, !texFile.hasPrefix("-"),
-                  !seen.contains(texFile) else { continue }
-            seen.insert(texFile)
-            if let img = UIImage(contentsOfFile: dir.appendingPathComponent(texFile).path) {
-                result.append(img)
+            let image: UIImage?
+            if let cached = imageCache[relativePath] {
+                image = cached
+            } else {
+                let loaded = UIImage(contentsOfFile: directory.appendingPathComponent(relativePath).path)
+                if let loaded { imageCache[relativePath] = loaded }
+                image = loaded
             }
+            if let image {
+                material.diffuse.contents = image
+                assignedCount += 1
+            }
+            material.isDoubleSided = true
         }
-        return result
+        print("OBJ 预览：按 MTL 映射恢复 \(assignedCount)/\(allMaterials.count) 个材质")
     }
 
     // MARK: - 材质修复

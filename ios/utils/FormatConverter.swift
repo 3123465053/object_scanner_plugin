@@ -76,7 +76,6 @@ struct FormatConverter {
         conversionQueue.async {
             do {
                 let inputURL = URL(fileURLWithPath: inputPath)
-                let inputExt = inputURL.pathExtension.lowercased()
                 let fileName = inputURL.deletingPathExtension().lastPathComponent
                 let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
 
@@ -232,85 +231,59 @@ struct FormatConverter {
         var allColor: [UInt8] = []  // RGB per vertex (3 bytes)
         var allIdx: [UInt32] = []
         var vertexOffset: UInt32 = 0
+        let meshes = collectMeshData(from: scene.rootNode)
+        var textureCache: [ObjectIdentifier: (pixels: [UInt8], width: Int, height: Int)] = [:]
 
-        func processNode(_ node: SCNNode) {
-            guard let geo = node.geometry else {
-                node.childNodes.forEach { processNode($0) }
-                return
-            }
+        for mesh in meshes {
+            let vertexCount = mesh.vertexCount
+            guard vertexCount > 0, !mesh.indices.isEmpty else { continue }
+            allPos.append(contentsOf: mesh.positions)
+            allNorm.append(contentsOf: mesh.normals)
 
-            var positions: [Float] = []
-            var normals: [Float] = []
-            var texCoords: [Float] = []
-            var colors: [Float] = []
-            var indices: [UInt32] = []
-
-            if let s = geo.sources(for: .vertex).first   { extractFloats(s, 3, &positions) }
-            if let s = geo.sources(for: .normal).first    { extractFloats(s, 3, &normals) }
-            if let s = geo.sources(for: .texcoord).first  { extractFloats(s, 2, &texCoords) }
-            if let s = geo.sources(for: .color).first     { extractFloats(s, 4, &colors) }
-            for e in geo.elements { extractIndices(e, 0, &indices) }
-
-            let vtxCount = positions.count / 3
-            guard vtxCount > 0, !indices.isEmpty else {
-                node.childNodes.forEach { processNode($0) }
-                return
-            }
-
-            allPos.append(contentsOf: positions)
-            allNorm.append(contentsOf: normals)
-
-            // 顶点颜色来源优先级: 已有顶点颜色 > 纹理烘焙 > 材质颜色 > 默认灰
-            if colors.count / 4 == vtxCount {
-                // 已有顶点颜色（float → UInt8）
-                for i in 0..<vtxCount {
-                    allColor.append(UInt8(clamping: Int(colors[i*4] * 255)))
-                    allColor.append(UInt8(clamping: Int(colors[i*4+1] * 255)))
-                    allColor.append(UInt8(clamping: Int(colors[i*4+2] * 255)))
+            // collectMeshData 已按 geometry element 拆分，每个子网格只对应一个材质。
+            if mesh.colors.count / 4 == vertexCount {
+                for index in 0..<vertexCount {
+                    allColor.append(UInt8(clamping: Int(mesh.colors[index * 4] * 255)))
+                    allColor.append(UInt8(clamping: Int(mesh.colors[index * 4 + 1] * 255)))
+                    allColor.append(UInt8(clamping: Int(mesh.colors[index * 4 + 2] * 255)))
                 }
-            } else if let mat = geo.firstMaterial,
-                      let texture = extractImage(from: mat.diffuse.contents),
-                      !texCoords.isEmpty,
-                      let (pixels, tw, th) = textureToRGBA(texture) {
-                // 从纹理+UV 烘焙
-                for i in 0..<vtxCount {
-                    let uvIdx = i * 2
-                    if uvIdx + 1 < texCoords.count {
-                        let u = max(0, min(1, texCoords[uvIdx]))
-                        let v = max(0, min(1, texCoords[uvIdx + 1]))
-                        let px = min(Int(u * Float(tw - 1)), tw - 1)
-                        let py = min(Int(v * Float(th - 1)), th - 1)
-                        let off = (py * tw + px) * 4
-                        allColor.append(pixels[off])     // R
-                        allColor.append(pixels[off + 1]) // G
-                        allColor.append(pixels[off + 2]) // B
-                    } else {
-                        allColor.append(contentsOf: [180, 180, 180])
+            } else if let texture = mesh.diffuseTexture,
+                      mesh.texCoords.count / 2 == vertexCount {
+                let key = ObjectIdentifier(texture)
+                let decoded: (pixels: [UInt8], width: Int, height: Int)?
+                if let cached = textureCache[key] {
+                    decoded = cached
+                } else if let value = textureToRGBA(texture) {
+                    textureCache[key] = value
+                    decoded = value
+                } else {
+                    decoded = nil
+                }
+
+                if let decoded {
+                    for index in 0..<vertexCount {
+                        let u = max(0, min(1, mesh.texCoords[index * 2]))
+                        let v = max(0, min(1, mesh.texCoords[index * 2 + 1]))
+                        let x = min(Int(u * Float(decoded.width - 1)), decoded.width - 1)
+                        let y = min(Int(v * Float(decoded.height - 1)), decoded.height - 1)
+                        let offset = (y * decoded.width + x) * 4
+                        allColor.append(decoded.pixels[offset])
+                        allColor.append(decoded.pixels[offset + 1])
+                        allColor.append(decoded.pixels[offset + 2])
                     }
-                }
-            } else if let mat = geo.firstMaterial, let c = mat.diffuse.contents as? UIColor {
-                // 纯色材质
-                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                c.getRed(&r, green: &g, blue: &b, alpha: &a)
-                let rb = UInt8(clamping: Int(r * 255))
-                let gb = UInt8(clamping: Int(g * 255))
-                let bb = UInt8(clamping: Int(b * 255))
-                for _ in 0..<vtxCount {
-                    allColor.append(contentsOf: [rb, gb, bb])
+                } else {
+                    for _ in 0..<vertexCount { allColor.append(contentsOf: [180, 180, 180]) }
                 }
             } else {
-                // 默认灰色
-                for _ in 0..<vtxCount {
-                    allColor.append(contentsOf: [180, 180, 180])
-                }
+                let red = UInt8(clamping: Int(mesh.diffuseR * 255))
+                let green = UInt8(clamping: Int(mesh.diffuseG * 255))
+                let blue = UInt8(clamping: Int(mesh.diffuseB * 255))
+                for _ in 0..<vertexCount { allColor.append(contentsOf: [red, green, blue]) }
             }
 
-            for idx in indices { allIdx.append(idx + vertexOffset) }
-            vertexOffset += UInt32(vtxCount)
-
-            node.childNodes.forEach { processNode($0) }
+            for index in mesh.indices { allIdx.append(index + vertexOffset) }
+            vertexOffset += UInt32(vertexCount)
         }
-        processNode(scene.rootNode)
 
         let totalVerts = allPos.count / 3
         let totalFaces = allIdx.count / 3
@@ -413,26 +386,83 @@ struct FormatConverter {
 
         func walk(_ node: SCNNode) {
             if let geo = node.geometry {
-                var m = MeshData()
-                if let s = geo.sources(for: .vertex).first   { extractFloats(s, 3, &m.positions) }
-                if let s = geo.sources(for: .normal).first    { extractFloats(s, 3, &m.normals) }
-                if let s = geo.sources(for: .texcoord).first  { extractFloats(s, 2, &m.texCoords) }
-                if let s = geo.sources(for: .color).first     { extractFloats(s, 4, &m.colors) }
-                for e in geo.elements { extractIndices(e, 0, &m.indices) }
+                var positions: [Float] = []
+                var normals: [Float] = []
+                var texCoords: [Float] = []
+                var colors: [Float] = []
+                if let s = geo.sources(for: .vertex).first  { extractFloats(s, 3, &positions) }
+                if let s = geo.sources(for: .normal).first   { extractFloats(s, 3, &normals) }
+                if let s = geo.sources(for: .texcoord).first { extractFloats(s, 2, &texCoords) }
+                if let s = geo.sources(for: .color).first    { extractFloats(s, 4, &colors) }
 
-                if let mat = geo.firstMaterial {
-                    if let img = extractImage(from: mat.diffuse.contents) {
-                        m.diffuseTexture = img
-                    } else if let c = mat.diffuse.contents as? UIColor {
-                        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                        c.getRed(&r, green: &g, blue: &b, alpha: &a)
-                        m.diffuseR = Float(r); m.diffuseG = Float(g); m.diffuseB = Float(b)
+                let sourceVertexCount = positions.count / 3
+                let hasNormals = normals.count / 3 == sourceVertexCount
+                let hasTexCoords = texCoords.count / 2 == sourceVertexCount
+                let hasColors = colors.count / 4 == sourceVertexCount
+
+                // SceneKit 按 elementIndex % materials.count 映射材质。每个 element
+                // 必须单独导出；合并后套 firstMaterial 会让所有面重复第一张贴图。
+                for (elementIndex, element) in geo.elements.enumerated() {
+                    var sourceIndices: [UInt32] = []
+                    extractIndices(element, 0, &sourceIndices)
+                    guard sourceIndices.count >= 3 else { continue }
+
+                    var mesh = MeshData()
+                    var remappedIndices: [UInt32: UInt32] = [:]
+                    remappedIndices.reserveCapacity(sourceIndices.count)
+
+                    func compactIndex(_ sourceIndex: UInt32) -> UInt32 {
+                        if let existing = remappedIndices[sourceIndex] { return existing }
+
+                        let old = Int(sourceIndex)
+                        let new = UInt32(mesh.vertexCount)
+                        remappedIndices[sourceIndex] = new
+                        mesh.positions.append(contentsOf: positions[(old * 3)..<(old * 3 + 3)])
+                        if hasNormals {
+                            mesh.normals.append(contentsOf: normals[(old * 3)..<(old * 3 + 3)])
+                        }
+                        if hasTexCoords {
+                            mesh.texCoords.append(contentsOf: texCoords[(old * 2)..<(old * 2 + 2)])
+                        }
+                        if hasColors {
+                            mesh.colors.append(contentsOf: colors[(old * 4)..<(old * 4 + 4)])
+                        }
+                        return new
                     }
-                    if let v = mat.metalness.contents as? NSNumber { m.metallic = v.floatValue }
-                    if let v = mat.roughness.contents as? NSNumber { m.roughness = v.floatValue }
-                }
 
-                if m.vertexCount > 0 && !m.indices.isEmpty { result.append(m) }
+                    for offset in stride(from: 0, to: sourceIndices.count - 2, by: 3) {
+                        let triangle = [
+                            sourceIndices[offset],
+                            sourceIndices[offset + 1],
+                            sourceIndices[offset + 2]
+                        ]
+                        guard triangle.allSatisfy({ Int($0) < sourceVertexCount }) else { continue }
+                        mesh.indices.append(contentsOf: triangle.map(compactIndex))
+                    }
+
+                    if !geo.materials.isEmpty {
+                        let material = geo.materials[elementIndex % geo.materials.count]
+                        if let image = extractImage(from: material.diffuse.contents) {
+                            mesh.diffuseTexture = image
+                        } else if let color = material.diffuse.contents as? UIColor {
+                            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                            color.getRed(&r, green: &g, blue: &b, alpha: &a)
+                            mesh.diffuseR = Float(r)
+                            mesh.diffuseG = Float(g)
+                            mesh.diffuseB = Float(b)
+                        }
+                        if let value = material.metalness.contents as? NSNumber {
+                            mesh.metallic = value.floatValue
+                        }
+                        if let value = material.roughness.contents as? NSNumber {
+                            mesh.roughness = value.floatValue
+                        }
+                    }
+
+                    if mesh.vertexCount > 0 && !mesh.indices.isEmpty {
+                        result.append(mesh)
+                    }
+                }
             }
             node.childNodes.forEach { walk($0) }
         }
