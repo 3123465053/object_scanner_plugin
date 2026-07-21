@@ -5,6 +5,7 @@
 //  格式转换工具
 
 import Foundation
+import CryptoKit
 import ModelIO
 import SceneKit
 import Flutter
@@ -378,71 +379,179 @@ struct FormatConverter {
         var metallic:  Float = 0.0
         var roughness: Float = 0.5
         var diffuseTexture: UIImage? = nil
+        var textureWrapS: SCNWrapMode = .repeat
+        var textureWrapT: SCNWrapMode = .repeat
         var vertexCount: Int { positions.count / 3 }
+    }
+
+    private struct MeshVertexKey: Hashable {
+        let position: UInt32
+        let normal: UInt32
+        let texCoord: UInt32
+        let color: UInt32
+    }
+
+    private struct MeshSourceData {
+        let values: [Float]
+        let components: Int
+        let vectorCount: Int
+        let indexChannel: Int
     }
 
     private static func collectMeshData(from root: SCNNode) -> [MeshData] {
         var result: [MeshData] = []
+        var imageCache: [ObjectIdentifier: UIImage] = [:]
 
         func walk(_ node: SCNNode) {
             if let geo = node.geometry {
-                var positions: [Float] = []
-                var normals: [Float] = []
-                var texCoords: [Float] = []
-                var colors: [Float] = []
-                if let s = geo.sources(for: .vertex).first  { extractFloats(s, 3, &positions) }
-                if let s = geo.sources(for: .normal).first   { extractFloats(s, 3, &normals) }
-                if let s = geo.sources(for: .texcoord).first { extractFloats(s, 2, &texCoords) }
-                if let s = geo.sources(for: .color).first    { extractFloats(s, 4, &colors) }
+                let positionSource = geo.sources(for: .vertex).first
+                let normalSource = geo.sources(for: .normal).first
+                let colorSource = geo.sources(for: .color).first
+                let textureSources = geo.sources(for: .texcoord)
+                guard let positionData = meshSourceData(
+                    for: positionSource,
+                    components: 3,
+                    in: geo
+                ) else {
+                    node.childNodes.forEach { walk($0) }
+                    return
+                }
 
-                let sourceVertexCount = positions.count / 3
-                let hasNormals = normals.count / 3 == sourceVertexCount
-                let hasTexCoords = texCoords.count / 2 == sourceVertexCount
-                let hasColors = colors.count / 4 == sourceVertexCount
+                let normalData = meshSourceData(for: normalSource, components: 3, in: geo)
+                let colorData = meshSourceData(for: colorSource, components: 4, in: geo)
+                let worldTransform = node.simdWorldTransform
+                let linearTransform = simd_float3x3(
+                    SIMD3<Float>(worldTransform.columns.0.x, worldTransform.columns.0.y, worldTransform.columns.0.z),
+                    SIMD3<Float>(worldTransform.columns.1.x, worldTransform.columns.1.y, worldTransform.columns.1.z),
+                    SIMD3<Float>(worldTransform.columns.2.x, worldTransform.columns.2.y, worldTransform.columns.2.z)
+                )
+                let determinant = simd_determinant(linearTransform)
+                let normalTransform = abs(determinant) > 1e-8
+                    ? simd_transpose(simd_inverse(linearTransform))
+                    : linearTransform
 
                 // SceneKit 按 elementIndex % materials.count 映射材质。每个 element
                 // 必须单独导出；合并后套 firstMaterial 会让所有面重复第一张贴图。
                 for (elementIndex, element) in geo.elements.enumerated() {
-                    var sourceIndices: [UInt32] = []
-                    extractIndices(element, 0, &sourceIndices)
-                    guard sourceIndices.count >= 3 else { continue }
-
                     var mesh = MeshData()
-                    var remappedIndices: [UInt32: UInt32] = [:]
-                    remappedIndices.reserveCapacity(sourceIndices.count)
-
-                    func compactIndex(_ sourceIndex: UInt32) -> UInt32 {
-                        if let existing = remappedIndices[sourceIndex] { return existing }
-
-                        let old = Int(sourceIndex)
-                        let new = UInt32(mesh.vertexCount)
-                        remappedIndices[sourceIndex] = new
-                        mesh.positions.append(contentsOf: positions[(old * 3)..<(old * 3 + 3)])
-                        if hasNormals {
-                            mesh.normals.append(contentsOf: normals[(old * 3)..<(old * 3 + 3)])
-                        }
-                        if hasTexCoords {
-                            mesh.texCoords.append(contentsOf: texCoords[(old * 2)..<(old * 2 + 2)])
-                        }
-                        if hasColors {
-                            mesh.colors.append(contentsOf: colors[(old * 4)..<(old * 4 + 4)])
-                        }
-                        return new
-                    }
-
-                    for offset in stride(from: 0, to: sourceIndices.count - 2, by: 3) {
-                        let triangle = [
-                            sourceIndices[offset],
-                            sourceIndices[offset + 1],
-                            sourceIndices[offset + 2]
-                        ]
-                        guard triangle.allSatisfy({ Int($0) < sourceVertexCount }) else { continue }
-                        mesh.indices.append(contentsOf: triangle.map(compactIndex))
-                    }
-
+                    let material: SCNMaterial?
                     if !geo.materials.isEmpty {
-                        let material = geo.materials[elementIndex % geo.materials.count]
-                        if let image = extractImage(from: material.diffuse.contents) {
+                        material = geo.materials[elementIndex % geo.materials.count]
+                    } else {
+                        material = nil
+                    }
+
+                    let mappingChannel = max(0, material?.diffuse.mappingChannel ?? 0)
+                    let textureSource = mappingChannel < textureSources.count
+                        ? textureSources[mappingChannel]
+                        : textureSources.first
+                    let textureData = meshSourceData(for: textureSource, components: 2, in: geo)
+
+                    var channelIndices: [Int: [UInt32]] = [:]
+                    func indices(for channel: Int) -> [UInt32] {
+                        if let cached = channelIndices[channel] { return cached }
+                        let decoded = extractIndices(element, channel: channel)
+                        channelIndices[channel] = decoded
+                        return decoded
+                    }
+
+                    let positionIndices = indices(for: positionData.indexChannel)
+                    guard positionIndices.count >= 3 else { continue }
+
+                    func validIndices(for source: MeshSourceData?) -> [UInt32]? {
+                        guard let source else { return nil }
+                        let sourceIndices = indices(for: source.indexChannel)
+                        guard sourceIndices.count == positionIndices.count,
+                              sourceIndices.allSatisfy({ Int($0) < source.vectorCount }) else {
+                            return nil
+                        }
+                        return sourceIndices
+                    }
+
+                    let normalIndices = validIndices(for: normalData)
+                    let textureIndices = validIndices(for: textureData)
+                    let colorIndices = validIndices(for: colorData)
+                    var remappedIndices: [MeshVertexKey: UInt32] = [:]
+                    remappedIndices.reserveCapacity(positionIndices.count)
+                    let textureTransform = material?.diffuse.contentsTransform ?? SCNMatrix4Identity
+
+                    func compactIndex(at corner: Int) -> UInt32? {
+                        let positionIndex = positionIndices[corner]
+                        guard Int(positionIndex) < positionData.vectorCount else { return nil }
+
+                        let normalIndex = normalIndices?[corner] ?? UInt32.max
+                        let textureIndex = textureIndices?[corner] ?? UInt32.max
+                        let colorIndex = colorIndices?[corner] ?? UInt32.max
+                        let key = MeshVertexKey(
+                            position: positionIndex,
+                            normal: normalIndex,
+                            texCoord: textureIndex,
+                            color: colorIndex
+                        )
+                        if let existing = remappedIndices[key] { return existing }
+
+                        let positionOffset = Int(positionIndex) * positionData.components
+                        let position = SIMD4<Float>(
+                            positionData.values[positionOffset],
+                            positionData.values[positionOffset + 1],
+                            positionData.values[positionOffset + 2],
+                            1
+                        )
+                        let transformedPosition = simd_mul(worldTransform, position)
+                        let newIndex = UInt32(mesh.vertexCount)
+                        remappedIndices[key] = newIndex
+                        mesh.positions.append(contentsOf: [
+                            transformedPosition.x,
+                            transformedPosition.y,
+                            transformedPosition.z
+                        ])
+
+                        if let normalData, normalIndex != UInt32.max {
+                            let offset = Int(normalIndex) * normalData.components
+                            let normal = SIMD3<Float>(
+                                normalData.values[offset],
+                                normalData.values[offset + 1],
+                                normalData.values[offset + 2]
+                            )
+                            let transformedNormal = simd_mul(normalTransform, normal)
+                            let length = simd_length(transformedNormal)
+                            let normalized = length > 1e-8 ? transformedNormal / length : transformedNormal
+                            mesh.normals.append(contentsOf: [normalized.x, normalized.y, normalized.z])
+                        }
+
+                        if let textureData, textureIndex != UInt32.max {
+                            let offset = Int(textureIndex) * textureData.components
+                            let u = textureData.values[offset]
+                            let v = textureData.values[offset + 1]
+                            mesh.texCoords.append(contentsOf: transformTextureCoordinate(
+                                u: u,
+                                v: v,
+                                by: textureTransform
+                            ))
+                        }
+
+                        if let colorData, colorIndex != UInt32.max {
+                            let offset = Int(colorIndex) * colorData.components
+                            mesh.colors.append(contentsOf: colorData.values[offset..<(offset + 4)])
+                        }
+                        return newIndex
+                    }
+
+                    for offset in stride(from: 0, to: positionIndices.count - 2, by: 3) {
+                        let corners = determinant < 0
+                            ? [offset, offset + 2, offset + 1]
+                            : [offset, offset + 1, offset + 2]
+                        let triangle = corners.compactMap(compactIndex)
+                        if triangle.count == 3 {
+                            mesh.indices.append(contentsOf: triangle)
+                        }
+                    }
+
+                    if let material {
+                        if let image = cachedImage(
+                            for: material,
+                            cache: &imageCache
+                        ) {
                             mesh.diffuseTexture = image
                         } else if let color = material.diffuse.contents as? UIColor {
                             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
@@ -457,6 +566,8 @@ struct FormatConverter {
                         if let value = material.roughness.contents as? NSNumber {
                             mesh.roughness = value.floatValue
                         }
+                        mesh.textureWrapS = material.diffuse.wrapS
+                        mesh.textureWrapT = material.diffuse.wrapT
                     }
 
                     if mesh.vertexCount > 0 && !mesh.indices.isEmpty {
@@ -468,6 +579,44 @@ struct FormatConverter {
         }
         walk(root)
         return result
+    }
+
+    private static func meshSourceData(for source: SCNGeometrySource?,
+                                       components: Int,
+                                       in geometry: SCNGeometry) -> MeshSourceData? {
+        guard let source else { return nil }
+        var values: [Float] = []
+        extractFloats(source, components, &values)
+        guard values.count == source.vectorCount * components else { return nil }
+
+        let sourceIndex = geometry.sources.firstIndex { $0 === source }
+        let channel = sourceIndex.flatMap { index -> Int? in
+            guard let channels = geometry.geometrySourceChannels, index < channels.count else { return nil }
+            return channels[index].intValue
+        } ?? 0
+        return MeshSourceData(
+            values: values,
+            components: components,
+            vectorCount: source.vectorCount,
+            indexChannel: max(0, channel)
+        )
+    }
+
+    private static func transformTextureCoordinate(u: Float,
+                                                   v: Float,
+                                                   by transform: SCNMatrix4) -> [Float] {
+        let transformedU = u * transform.m11 + v * transform.m21 + transform.m41
+        let transformedV = u * transform.m12 + v * transform.m22 + transform.m42
+        return [transformedU, transformedV]
+    }
+
+    private static func cachedImage(for material: SCNMaterial,
+                                    cache: inout [ObjectIdentifier: UIImage]) -> UIImage? {
+        let key = ObjectIdentifier(material)
+        if let cached = cache[key] { return cached }
+        guard let image = extractImage(from: material.diffuse.contents) else { return nil }
+        cache[key] = image
+        return image
     }
 
     private static func extractImage(from contents: Any?) -> UIImage? {
@@ -505,7 +654,12 @@ struct FormatConverter {
         var gltfMats:    [[String: Any]] = []
         var gltfImages:  [[String: Any]] = []
         var gltfTextures:[[String: Any]] = []
+        var gltfSamplers:[[String: Any]] = []
         var nodeIndices: [Int] = []
+        var imageByObject: [ObjectIdentifier: Int] = [:]
+        var imageByDigest: [Data: Int] = [:]
+        var samplerByKey: [String: Int] = [:]
+        var textureByKey: [String: Int] = [:]
 
         func appendBuf(_ floats: [Float]) -> (Int, Int) {
             let off = binData.count
@@ -542,6 +696,58 @@ struct FormatConverter {
             accessors.append(a)
             return accessors.count - 1
         }
+        func gltfWrapMode(_ mode: SCNWrapMode) -> Int {
+            switch mode {
+            case .repeat: return 10497
+            case .mirror: return 33648
+            default: return 33071
+            }
+        }
+        func samplerIndex(wrapS: SCNWrapMode, wrapT: SCNWrapMode) -> Int {
+            let s = gltfWrapMode(wrapS)
+            let t = gltfWrapMode(wrapT)
+            let key = "\(s):\(t)"
+            if let existing = samplerByKey[key] { return existing }
+            let index = gltfSamplers.count
+            gltfSamplers.append([
+                "magFilter": 9729,
+                "minFilter": 9987,
+                "wrapS": s,
+                "wrapT": t
+            ])
+            samplerByKey[key] = index
+            return index
+        }
+        func imageIndex(for image: UIImage) -> Int? {
+            let objectKey = ObjectIdentifier(image)
+            if let existing = imageByObject[objectKey] { return existing }
+            guard let (bytes, mimeType) = encodeTexture(image) else { return nil }
+            let digest = Data(SHA256.hash(data: bytes))
+            if let existing = imageByDigest[digest] {
+                imageByObject[objectKey] = existing
+                return existing
+            }
+
+            let (offset, length) = appendRaw(bytes)
+            let bufferView = addBVPlain(offset, length)
+            let index = gltfImages.count
+            gltfImages.append(["bufferView": bufferView, "mimeType": mimeType])
+            imageByObject[objectKey] = index
+            imageByDigest[digest] = index
+            return index
+        }
+        func addTexture(for image: UIImage,
+                        wrapS: SCNWrapMode,
+                        wrapT: SCNWrapMode) -> Int? {
+            guard let imageIndex = imageIndex(for: image) else { return nil }
+            let samplerIndex = samplerIndex(wrapS: wrapS, wrapT: wrapT)
+            let key = "\(imageIndex):\(samplerIndex)"
+            if let existing = textureByKey[key] { return existing }
+            let index = gltfTextures.count
+            gltfTextures.append(["source": imageIndex, "sampler": samplerIndex])
+            textureByKey[key] = index
+            return index
+        }
 
         for (i, m) in meshes.enumerated() {
             let matIdx = gltfMats.count
@@ -550,14 +756,13 @@ struct FormatConverter {
                 "roughnessFactor": m.roughness
             ]
 
-            if let tex = m.diffuseTexture, let (texBytes, mimeType) = encodeTexture(tex) {
-                let (imgOff, imgLen) = appendRaw(texBytes)
-                let imgBV = addBVPlain(imgOff, imgLen)
-                let imgIdx = gltfImages.count
-                gltfImages.append(["bufferView": imgBV, "mimeType": mimeType])
-                let texIdx = gltfTextures.count
-                gltfTextures.append(["source": imgIdx])
-                pbrDict["baseColorTexture"] = ["index": texIdx]
+            if let texture = m.diffuseTexture,
+               let textureIndex = addTexture(
+                for: texture,
+                wrapS: m.textureWrapS,
+                wrapT: m.textureWrapT
+               ) {
+                pbrDict["baseColorTexture"] = ["index": textureIndex]
             } else {
                 pbrDict["baseColorFactor"] = [m.diffuseR, m.diffuseG, m.diffuseB, 1.0]
             }
@@ -605,6 +810,7 @@ struct FormatConverter {
         ]
         if !gltfImages.isEmpty { json["images"] = gltfImages }
         if !gltfTextures.isEmpty { json["textures"] = gltfTextures }
+        if !gltfSamplers.isEmpty { json["samplers"] = gltfSamplers }
 
         let jsonData = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
         if binary {
@@ -636,11 +842,19 @@ struct FormatConverter {
         data.withUnsafeBytes { ptr in
             for i in 0..<count {
                 for c in 0..<comps {
+                    guard c < src.componentsPerVector else {
+                        arr.append(src.semantic == .color && c == 3 ? 1 : 0)
+                        continue
+                    }
                     let off = offset + i * stride + c * bpc
-                    guard off + bpc <= data.count else { continue }
+                    guard off + bpc <= data.count else {
+                        arr.append(0)
+                        continue
+                    }
                     if src.usesFloatComponents {
                         if bpc == 4 { arr.append(ptr.load(fromByteOffset: off, as: Float.self)) }
                         else if bpc == 8 { arr.append(Float(ptr.load(fromByteOffset: off, as: Double.self))) }
+                        else { arr.append(0) }
                     } else {
                         switch bpc {
                         case 1: arr.append(Float(ptr.load(fromByteOffset: off, as: UInt8.self)) / 255.0)
@@ -653,28 +867,126 @@ struct FormatConverter {
         }
     }
 
-    private static func extractIndices(_ elem: SCNGeometryElement, _ base: UInt32, _ arr: inout [UInt32]) {
-        let data = elem.data, bpi = elem.bytesPerIndex, count = elem.primitiveCount
-        func idx(_ i: Int) -> UInt32 {
-            data.withUnsafeBytes {
-                switch bpi {
-                case 1: return UInt32($0.load(fromByteOffset: i*bpi, as: UInt8.self))
-                case 2: return UInt32($0.load(fromByteOffset: i*bpi, as: UInt16.self))
-                case 4: return $0.load(fromByteOffset: i*bpi, as: UInt32.self)
-                default: return 0
+    private static func extractIndices(_ element: SCNGeometryElement, channel requestedChannel: Int) -> [UInt32] {
+        let primitiveCount = element.primitiveCount
+        guard primitiveCount > 0 else { return [] }
+
+        let range = element.primitiveRange
+        let rangeStart = range.location == NSNotFound ? 0 : min(range.location, primitiveCount)
+        let rangeCount = range.location == NSNotFound
+            ? primitiveCount
+            : min(range.length, primitiveCount - rangeStart)
+        guard rangeCount > 0 else { return [] }
+
+        let channelCount = max(1, element.indicesChannelCount)
+        let channel = min(max(0, requestedChannel), channelCount - 1)
+        let bytesPerIndex = element.bytesPerIndex
+        let data = element.data
+
+        func rawIndex(at storedIndex: Int) -> UInt32? {
+            if data.isEmpty { return UInt32(storedIndex) }
+            let byteOffset = storedIndex * bytesPerIndex
+            guard bytesPerIndex == 1 || bytesPerIndex == 2 || bytesPerIndex == 4,
+                  byteOffset >= 0,
+                  byteOffset + bytesPerIndex <= data.count else {
+                return nil
+            }
+            return data.withUnsafeBytes { bytes in
+                switch bytesPerIndex {
+                case 1:
+                    return UInt32(bytes.load(fromByteOffset: byteOffset, as: UInt8.self))
+                case 2:
+                    return UInt32(bytes.load(fromByteOffset: byteOffset, as: UInt16.self))
+                case 4:
+                    return bytes.load(fromByteOffset: byteOffset, as: UInt32.self)
+                default:
+                    return nil
                 }
             }
         }
-        switch elem.primitiveType {
-        case .triangles:
-            for i in 0..<count*3 { arr.append(base + idx(i)) }
-        case .triangleStrip:
-            for i in 0..<count {
-                let a = base+idx(i), b = base+idx(i+1), c = base+idx(i+2)
-                arr.append(contentsOf: i%2==0 ? [a,b,c] : [b,a,c])
+
+        func channelIndex(logicalIndex: Int,
+                          logicalCount: Int,
+                          headerCount: Int = 0) -> UInt32? {
+            let storedIndex: Int
+            if channelCount == 1 {
+                storedIndex = headerCount + logicalIndex
+            } else if element.hasInterleavedIndicesChannels {
+                storedIndex = headerCount + logicalIndex * channelCount + channel
+            } else {
+                storedIndex = headerCount + channel * logicalCount + logicalIndex
             }
-        default: break
+            return rawIndex(at: storedIndex)
         }
+
+        var result: [UInt32] = []
+        result.reserveCapacity(rangeCount * 3)
+
+        switch element.primitiveType {
+        case .triangles:
+            let logicalCount = primitiveCount * 3
+            let first = rangeStart * 3
+            let end = first + rangeCount * 3
+            for logicalIndex in first..<end {
+                if let index = channelIndex(logicalIndex: logicalIndex, logicalCount: logicalCount) {
+                    result.append(index)
+                }
+            }
+
+        case .triangleStrip:
+            let logicalCount = primitiveCount + 2
+            for primitive in rangeStart..<(rangeStart + rangeCount) {
+                guard let first = channelIndex(logicalIndex: primitive, logicalCount: logicalCount),
+                      let second = channelIndex(logicalIndex: primitive + 1, logicalCount: logicalCount),
+                      let third = channelIndex(logicalIndex: primitive + 2, logicalCount: logicalCount) else {
+                    continue
+                }
+                result.append(contentsOf: primitive.isMultiple(of: 2)
+                    ? [first, second, third]
+                    : [second, first, third])
+            }
+
+        case .polygon:
+            var polygonSizes: [Int] = []
+            polygonSizes.reserveCapacity(primitiveCount)
+            for primitive in 0..<primitiveCount {
+                guard let size = rawIndex(at: primitive) else { return [] }
+                polygonSizes.append(Int(size))
+            }
+            let logicalCount = polygonSizes.reduce(0, +)
+            var logicalOffset = polygonSizes.prefix(rangeStart).reduce(0, +)
+            for primitive in rangeStart..<(rangeStart + rangeCount) {
+                let size = polygonSizes[primitive]
+                guard size >= 3,
+                      let first = channelIndex(
+                        logicalIndex: logicalOffset,
+                        logicalCount: logicalCount,
+                        headerCount: primitiveCount
+                      ) else {
+                    logicalOffset += size
+                    continue
+                }
+                for corner in 1..<(size - 1) {
+                    guard let second = channelIndex(
+                        logicalIndex: logicalOffset + corner,
+                        logicalCount: logicalCount,
+                        headerCount: primitiveCount
+                    ), let third = channelIndex(
+                        logicalIndex: logicalOffset + corner + 1,
+                        logicalCount: logicalCount,
+                        headerCount: primitiveCount
+                    ) else {
+                        continue
+                    }
+                    result.append(contentsOf: [first, second, third])
+                }
+                logicalOffset += size
+            }
+
+        default:
+            break
+        }
+        return result
     }
 
     private static func computeBounds(_ p: [Float]) -> (min: (x:Float,y:Float,z:Float), max: (x:Float,y:Float,z:Float)) {

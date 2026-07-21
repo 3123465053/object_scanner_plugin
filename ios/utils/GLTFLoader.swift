@@ -251,6 +251,7 @@ struct GLTFLoader {
 
         // 解析 textures 数组：texture → image 的映射
         let texturesArr = json["textures"] as? [[String: Any]] ?? []
+        let samplersArr = json["samplers"] as? [[String: Any]] ?? []
 
         return mats.map { matJson in
             let mat = SCNMaterial()
@@ -266,6 +267,11 @@ struct GLTFLoader {
                    imgIdx < images.count,
                    let image = images[imgIdx] {           // 解包 UIImage?，nil 则跳过
                     mat.diffuse.contents = image
+                    configureSampling(
+                        for: mat.diffuse,
+                        texture: texturesArr[texIdx],
+                        samplers: samplersArr
+                    )
                     // 如果同时有 baseColorFactor，用作色调调制（乘法混合）
                     // SceneKit 不直接支持乘法混合，但设置 multiply 可以近似
                     if let factor = pbr["baseColorFactor"] as? [NSNumber], factor.count >= 4 {
@@ -297,6 +303,16 @@ struct GLTFLoader {
                     // SceneKit 不能直接拆分通道，设置到 metalness 贴图
                     mat.metalness.contents = image
                     mat.roughness.contents = image
+                    configureSampling(
+                        for: mat.metalness,
+                        texture: texturesArr[texIdx],
+                        samplers: samplersArr
+                    )
+                    configureSampling(
+                        for: mat.roughness,
+                        texture: texturesArr[texIdx],
+                        samplers: samplersArr
+                    )
                 } else {
                     if let metallic = pbr["metallicFactor"] as? NSNumber {
                         mat.metalness.contents = metallic.floatValue
@@ -315,6 +331,11 @@ struct GLTFLoader {
                imgIdx < images.count,
                let image = images[imgIdx] {
                 mat.normal.contents = image
+                configureSampling(
+                    for: mat.normal,
+                    texture: texturesArr[texIdx],
+                    samplers: samplersArr
+                )
             }
 
             // emissive
@@ -325,6 +346,11 @@ struct GLTFLoader {
                imgIdx < images.count,
                let image = images[imgIdx] {
                 mat.emission.contents = image
+                configureSampling(
+                    for: mat.emission,
+                    texture: texturesArr[texIdx],
+                    samplers: samplersArr
+                )
             } else if let emissive = matJson["emissiveFactor"] as? [NSNumber], emissive.count >= 3 {
                 mat.emission.contents = UIColor(
                     red: CGFloat(emissive[0].floatValue),
@@ -342,9 +368,60 @@ struct GLTFLoader {
                imgIdx < images.count,
                let image = images[imgIdx] {
                 mat.ambientOcclusion.contents = image
+                configureSampling(
+                    for: mat.ambientOcclusion,
+                    texture: texturesArr[texIdx],
+                    samplers: samplersArr
+                )
             }
 
             return mat
+        }
+    }
+
+    private static func configureSampling(for property: SCNMaterialProperty,
+                                          texture: [String: Any],
+                                          samplers: [[String: Any]]) {
+        let sampler: [String: Any]
+        if let index = texture["sampler"] as? Int, index >= 0, index < samplers.count {
+            sampler = samplers[index]
+        } else {
+            sampler = [:]
+        }
+
+        func wrapMode(_ value: Int) -> SCNWrapMode {
+            switch value {
+            case 33071: return .clamp
+            case 33648: return .mirror
+            default: return .repeat
+            }
+        }
+
+        property.wrapS = wrapMode(sampler["wrapS"] as? Int ?? 10497)
+        property.wrapT = wrapMode(sampler["wrapT"] as? Int ?? 10497)
+        property.magnificationFilter = (sampler["magFilter"] as? Int ?? 9729) == 9728
+            ? .nearest
+            : .linear
+
+        switch sampler["minFilter"] as? Int ?? 9987 {
+        case 9728:
+            property.minificationFilter = .nearest
+            property.mipFilter = .none
+        case 9729:
+            property.minificationFilter = .linear
+            property.mipFilter = .none
+        case 9984:
+            property.minificationFilter = .nearest
+            property.mipFilter = .nearest
+        case 9985:
+            property.minificationFilter = .linear
+            property.mipFilter = .nearest
+        case 9986:
+            property.minificationFilter = .nearest
+            property.mipFilter = .linear
+        default:
+            property.minificationFilter = .linear
+            property.mipFilter = .linear
         }
     }
 
