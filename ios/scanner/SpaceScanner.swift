@@ -500,7 +500,9 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
 
     func stopScanningAndExport() -> URL? {
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let fileURL = documentsURL.appendingPathComponent("scan_\(Date().timeIntervalSince1970).usdc")
+        let scanName = "scan_\(Int(Date().timeIntervalSince1970 * 1000))"
+        let outputDirectory = documentsURL.appendingPathComponent(scanName, isDirectory: true)
+        let fileURL = outputDirectory.appendingPathComponent("\(scanName).usdc")
 
         guard let frame = sceneView.session.currentFrame else {
             print("❌ 无法获取当前帧"); return nil
@@ -597,6 +599,9 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         guard !anchors.isEmpty else {
             throw NSError(domain: "SpaceScanner", code: 1, userInfo: [NSLocalizedDescriptionKey: "没有网格数据"])
         }
+        guard !snapshots.isEmpty else {
+            throw NSError(domain: "SpaceScanner", code: 7, userInfo: [NSLocalizedDescriptionKey: "没有可用的纹理帧"])
+        }
 
         // 先按整个场景的可见覆盖率筛选少量共同关键帧。所有 ARMeshAnchor
         // 共用这组候选，避免每个网格块各选各的照片。
@@ -613,21 +618,36 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         }
         print("🎞️ 纹理关键帧: \(snapshots.count) → \(projectors.count)")
         print("📐 深度快照: \(depthSnapshotCount)/\(projectors.count)")
-        let snapshotMaterials: [SCNMaterial?] = selectedSnapshots.map { snapshot in
-            guard let image = UIImage(data: snapshot.imageData) else { return nil }
+        let stagingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scan_textures_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
+
+        var snapshotMaterials = [SCNMaterial?]()
+        snapshotMaterials.reserveCapacity(selectedSnapshots.count)
+        for (index, snapshot) in selectedSnapshots.enumerated() {
+            let textureURL = stagingDir.appendingPathComponent(
+                String(format: "capture_%03d.jpg", index)
+            )
+            do {
+                try snapshot.imageData.write(to: textureURL, options: .atomic)
+            } catch {
+                snapshotMaterials.append(nil)
+                continue
+            }
             let material = SCNMaterial()
             material.lightingModel = .physicallyBased
             material.isDoubleSided = true
             material.metalness.contents = 0.0
             material.roughness.contents = 1.0
-            material.diffuse.contents = image
+            material.diffuse.contents = textureURL
             material.diffuse.wrapS = .clamp
             material.diffuse.wrapT = .clamp
             material.diffuse.magnificationFilter = .linear
             material.diffuse.minificationFilter = .linear
             material.diffuse.mipFilter = .linear
             material.diffuse.maxAnisotropy = 8
-            return material
+            snapshotMaterials.append(material)
         }
         let scene = SCNScene()
         let rootNode = SCNNode()
@@ -650,17 +670,46 @@ final class SpaceScannerViewModel: NSObject, ObservableObject, ARSCNViewDelegate
         scene.rootNode.addChildNode(rootNode)
 
         print("📦 有纹理: \(totalTexturedFaces) 面, 已隐藏: \(totalHiddenFaces) 面")
+        guard totalTexturedFaces > 0 else {
+            throw NSError(domain: "SpaceScanner", code: 8, userInfo: [NSLocalizedDescriptionKey: "没有任何网格面成功生成纹理"])
+        }
 
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: url)
 
-        guard scene.write(to: url, options: [:], delegate: nil, progressHandler: nil) else {
+        var exportError: Error?
+        let options: [String: Any] = [SCNSceneExportDestinationURL: url]
+        guard scene.write(to: url, options: options, delegate: nil, progressHandler: { _, error, _ in
+            if let error { exportError = error }
+        }) else {
             throw NSError(domain: "SpaceScanner", code: 5, userInfo: [NSLocalizedDescriptionKey: "导出失败"])
         }
+        if let exportError { throw exportError }
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw NSError(domain: "SpaceScanner", code: 3, userInfo: [NSLocalizedDescriptionKey: "文件不存在"])
         }
+
+        let imageExtensions = Set(["png", "jpg", "jpeg"])
+        let resources = FileManager.default.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        var exportedTextureCount = 0
+        while let resourceURL = resources?.nextObject() as? URL {
+            if imageExtensions.contains(resourceURL.pathExtension.lowercased()) {
+                exportedTextureCount += 1
+            }
+        }
+        guard exportedTextureCount > 0 else {
+            throw NSError(
+                domain: "SpaceScanner",
+                code: 6,
+                userInfo: [NSLocalizedDescriptionKey: "USDC 已生成，但纹理资源未写出"]
+            )
+        }
+        print("🖼️ 已写出纹理: \(exportedTextureCount) 张")
         if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
            let size = attrs[.size] as? Int64 {
             print("✅ 导出完成: \(String(format: "%.2f", Double(size)/1024/1024)) MB")

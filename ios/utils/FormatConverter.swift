@@ -97,8 +97,13 @@ struct FormatConverter {
                 // SceneKit 原生写入
                 // ★ scene.write() 可能在内部修改 mat.diffuse.contents（UIImage → 内部纹理句柄），
                 //   先保存再还原，确保缓存的 SCNScene 对后续格式仍有效
-                case "usdz", "usdc", "usda", "usd", "scn":
+                case "usdz", "scn":
                     success = sceneWritePreserving(scene: scene, to: outputURL)
+
+                // USD/USDA/USDC 必须把内存纹理先落盘，再由 SceneKit 直接写出。
+                // ModelIO 对 USDZ 二次导出会丢失 UsdPreviewSurface 材质网络。
+                case "usdc", "usda", "usd":
+                    success = try sceneWriteWithExternalTextures(scene: scene, to: outputURL)
 
                 // GLB/GLTF 自定义导出器
                 case "glb", "gltf":
@@ -141,69 +146,89 @@ struct FormatConverter {
         }
     }
 
-    // MARK: - 通过临时 USDZ 中转导出
+    // MARK: - USD 导出
 
-    /// SCNScene → 临时 USDZ（内嵌纹理）→ MDLAsset.export 到目标格式
-    private static func convertViaTempUSDZ(scene: SCNScene, outputURL: URL, format: String) throws -> Bool {
-        // 步骤0: 将内存中的 UIImage 纹理物化为磁盘 JPEG 文件
-        // SceneKit 的 scene.write() 无法序列化内存中的 UIImage 对象，
-        // 只能引用文件路径；若不提前物化，USDZ 里会出现悬空的 texgen_N.png
-        //
-        // 重要：物化前先记录原始 contents，defer 里恢复，
-        // 保证缓存中的 SCNScene 可被后续格式转换复用。
-        let texDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sctex_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: texDir, withIntermediateDirectories: true)
+    /// SceneKit 的 USD 导出器只会为文件 URL 建立纹理引用。这里先把所有可解码的
+    /// diffuse 纹理写到临时目录，再通过 SCNSceneExportDestinationURL 让导出器把
+    /// 资源复制到目标目录并生成正确的相对路径。
+    private static func sceneWriteWithExternalTextures(scene: SCNScene, to outputURL: URL) throws -> Bool {
+        let stagingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usd_textures_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
-        var texCounter = 0
-        // (material, originalContents) — 用于 defer 恢复
         var savedContents: [(SCNMaterial, Any?)] = []
+        var visitedMaterials = Set<ObjectIdentifier>()
+        var textureCount = 0
 
         scene.rootNode.enumerateHierarchy { node, _ in
-            for mat in node.geometry?.materials ?? [] {
-                if let img = mat.diffuse.contents as? UIImage,
-                   let data = img.jpegData(compressionQuality: 0.92) {
-                    let fileURL = texDir.appendingPathComponent("diff\(texCounter).jpg")
-                    if (try? data.write(to: fileURL)) != nil {
-                        savedContents.append((mat, img))   // 保存原始 UIImage
-                        mat.diffuse.contents = fileURL     // 物化为文件路径
-                        texCounter += 1
-                    }
+            for material in node.geometry?.materials ?? [] {
+                let key = ObjectIdentifier(material)
+                guard visitedMaterials.insert(key).inserted,
+                      let image = extractImage(from: material.diffuse.contents),
+                      let encoded = encodeTexture(image) else { continue }
+
+                let (data, mimeType) = encoded
+                let ext = mimeType == "image/png" ? "png" : "jpg"
+                let fileName = "texture_\(String(format: "%03d", textureCount)).\(ext)"
+                let textureURL = stagingDir
+                    .appendingPathComponent(fileName)
+                do {
+                    try data.write(to: textureURL, options: .atomic)
+                    savedContents.append((material, material.diffuse.contents))
+                    material.diffuse.contents = textureURL
+                    textureCount += 1
+                } catch {
+                    continue
                 }
             }
         }
 
-        // defer 里无论成功/异常都恢复材质，保证缓存 Scene 状态干净
         defer {
-            for (mat, original) in savedContents {
-                mat.diffuse.contents = original
+            for (material, originalContents) in savedContents {
+                material.diffuse.contents = originalContents
             }
-            try? FileManager.default.removeItem(at: texDir)
+            try? FileManager.default.removeItem(at: stagingDir)
         }
 
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("temp_\(UUID().uuidString).usdz")
-        defer { try? FileManager.default.removeItem(at: tempURL) }
-
-        // 步骤1: SCNScene → USDZ（SceneKit 会将纹理打包进 USDZ）
-        guard scene.write(to: tempURL, options: nil, delegate: nil, progressHandler: nil) else {
-            throw convError("无法创建临时 USDZ")
+        var exportError: Error?
+        let options: [String: Any] = [SCNSceneExportDestinationURL: outputURL]
+        let success = scene.write(
+            to: outputURL,
+            options: options,
+            delegate: nil
+        ) { _, error, _ in
+            if let error { exportError = error }
         }
 
-        // 步骤2: 从 USDZ 加载 MDLAsset（纹理完整保留）
-        let asset = MDLAsset(url: tempURL)
-        asset.loadTextures()
+        if let exportError { throw exportError }
+        guard success else { throw convError("SceneKit 写入 USD 失败") }
 
-        guard MDLAsset.canExportFileExtension(format) else {
-            throw convError("不支持导出 \(format) 格式")
+        let attrs = try FileManager.default.attributesOfItem(atPath: outputURL.path)
+        let size = attrs[.size] as? Int64 ?? 0
+        guard size > 0 else { throw convError("USD 输出文件为空") }
+
+        if textureCount > 0 {
+            let outputDir = outputURL.deletingLastPathComponent()
+            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey]
+            let enumerator = FileManager.default.enumerator(
+                at: outputDir,
+                includingPropertiesForKeys: Array(resourceKeys),
+                options: [.skipsHiddenFiles]
+            )
+            let imageExtensions = Set(["png", "jpg", "jpeg"])
+            var hasExportedTexture = false
+            while let resourceURL = enumerator?.nextObject() as? URL {
+                if imageExtensions.contains(resourceURL.pathExtension.lowercased()) {
+                    hasExportedTexture = true
+                    break
+                }
+            }
+            guard hasExportedTexture else {
+                throw convError("USD 已生成，但纹理资源未写出")
+            }
         }
 
-        // 步骤3: MDLAsset 导出到目标格式
-        try asset.export(to: outputURL)
-
-        let attrs = try? FileManager.default.attributesOfItem(atPath: outputURL.path)
-        let size = attrs?[.size] as? Int64 ?? 0
-        return size > 0
+        return true
     }
 
     // MARK: - 输入加载
