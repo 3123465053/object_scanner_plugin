@@ -41,7 +41,7 @@ struct GLTFLoader {
         let jsonChunkLen = Int(data.withUnsafeBytes { $0.load(fromByteOffset: 12, as: UInt32.self) })
         let jsonStart = 20
         guard jsonStart + jsonChunkLen <= data.count else { throw err("JSON chunk 越界") }
-        let jsonData = data.subdata(in: jsonStart..<(jsonStart + jsonChunkLen))
+        let jsonData = data[jsonStart..<(jsonStart + jsonChunkLen)]
         let jsonObj = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] ?? [:]
 
         var binData = Data()
@@ -50,7 +50,9 @@ struct GLTFLoader {
             let binChunkLen = Int(data.withUnsafeBytes { $0.load(fromByteOffset: binChunkStart, as: UInt32.self) })
             let binStart = binChunkStart + 8
             if binStart + binChunkLen <= data.count {
-                binData = data.subdata(in: binStart..<(binStart + binChunkLen))
+                // 保留 mmap 数据的切片视图，不再用 subdata 复制整个 BIN chunk。
+                // 大型 GLB 的 BIN 常达数百 MB，这一份复制足以触发 NSMallocException。
+                binData = data[binStart..<(binStart + binChunkLen)]
             }
         }
 
@@ -67,7 +69,10 @@ struct GLTFLoader {
         if uri.hasPrefix("data:"), let range = uri.range(of: ";base64,") {
             return Data(base64Encoded: String(uri[range.upperBound...])) ?? Data()
         }
-        return try Data(contentsOf: baseURL.appendingPathComponent(uri))
+        return try Data(
+            contentsOf: baseURL.appendingPathComponent(uri),
+            options: .mappedIfSafe
+        )
     }
 
     // MARK: - 构建 SCNScene

@@ -24,14 +24,18 @@ class Model: ObservableObject {
 
         let ext = url.pathExtension.lowercased()
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        ModelWorkQueue.shared.async { [weak self] in
+          autoreleasepool {
+            guard self != nil else { return }
             var loaded: SCNScene?
 
             switch ext {
             case "glb", "gltf":
                 loaded = try? GLTFLoader.loadScene(from: url)
 
-            case "scn":
+            case "scn", "usd", "usda", "usdc", "usdz":
+                // 直接让 SceneKit 读取可避免 MDLAsset.loadTextures() 预先解码并
+                // 常驻全部贴图；对带多张相机纹理的扫描模型尤其重要。
                 loaded = try? SCNScene(url: url, options: nil)
 
             case "obj":
@@ -63,7 +67,12 @@ class Model: ObservableObject {
                 self?.scene = scene
                 self?.isLoading = false
             }
+          }
         }
+    }
+
+    deinit {
+        scene = nil
     }
 
     // MARK: - OBJ 纹理手动加载
@@ -184,8 +193,9 @@ class Model: ObservableObject {
             for material in geo.materials {
                 material.diffuse.magnificationFilter = .linear
                 material.diffuse.minificationFilter = .linear
-                material.diffuse.mipFilter = .linear
-                material.diffuse.maxAnisotropy = 8
+                // 预览不生成 mipmap，避免每张纹理额外占用约三分之一 GPU 内存。
+                material.diffuse.mipFilter = .none
+                material.diffuse.maxAnisotropy = 2
             }
         }
         for child in node.childNodes { fixMaterials(child, ext: ext) }
@@ -210,7 +220,7 @@ struct SceneView: UIViewRepresentable {
         let view = SCNView()
         view.autoenablesDefaultLighting = true
         view.allowsCameraControl = true
-        view.antialiasingMode = .multisampling4X
+        view.antialiasingMode = .multisampling2X
         view.scene = scene
         view.backgroundColor = UIColor(red: 10/255, green: 12/255, blue: 24/255, alpha: 1)
 
@@ -225,7 +235,13 @@ struct SceneView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: SCNView, context: Context) {
-        uiView.scene = scene
+        if uiView.scene !== scene { uiView.scene = scene }
+    }
+
+    static func dismantleUIView(_ uiView: SCNView, coordinator: ()) {
+        uiView.isPlaying = false
+        uiView.delegate = nil
+        uiView.scene = nil
     }
 }
 

@@ -13,52 +13,14 @@ import CoreImage
 
 struct FormatConverter {
 
-    // MARK: - Scene 缓存（同一文件多格式转换时只解码一次）
-    // 使用 NSLock 保证线程安全（转换运行在 global queue 上）
-    private static let _lock = NSLock()
-    private static var _cachedURL:   URL?      = nil
-    private static var _cachedScene: SCNScene? = nil
-
-    /// 从缓存取 Scene；缓存未命中时解码并存入缓存
-    private static func cachedScene(for url: URL) throws -> SCNScene {
-        _lock.lock()
-        if _cachedURL == url, let hit = _cachedScene {
-            _lock.unlock()
-            return hit
-        }
-        _lock.unlock()
-
-        // 缓存未命中：重新加载（可能耗时）
-        let fresh = try _loadSceneFresh(from: url)
-
-        _lock.lock()
-        _cachedURL   = url
-        _cachedScene = fresh
-        _lock.unlock()
-
-        return fresh
-    }
-
-    /// 清除 Scene 缓存（切换文件时释放内存）
-    static func clearSceneCache() {
-        _lock.lock()
-        _cachedURL   = nil
-        _cachedScene = nil
-        _lock.unlock()
-    }
-
     static let supportedFormats = [
         "obj", "stl", "ply", "usd", "usda", "usdc",
         "usdz", "scn",
         "glb", "gltf"
     ]
 
-    // 串行转换队列：所有格式转换依次执行，避免并发时内存爆涨、Scene 缓存失效
-    // qos: .userInitiated 保证系统给足 CPU，但同一时刻只跑一个任务
-    private static let conversionQueue = DispatchQueue(
-        label: "com.objectscanner.conversion",
-        qos: .userInitiated
-    )
+    // 转换和预览共享串行队列，避免同时解码两个大模型导致内存峰值翻倍。
+    private static let conversionQueue = ModelWorkQueue.shared
 
     // MARK: - 主入口
 
@@ -75,7 +37,8 @@ struct FormatConverter {
         }
 
         conversionQueue.async {
-            do {
+            autoreleasepool {
+              do {
                 let inputURL = URL(fileURLWithPath: inputPath)
                 let fileName = inputURL.deletingPathExtension().lastPathComponent
                 let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -89,8 +52,9 @@ struct FormatConverter {
                 try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true, attributes: nil)
                 let outputURL = outputDir.appendingPathComponent("\(fileName).\(format)")
 
-                // 使用缓存：同一文件多格式转换时只解码一次
-                let scene = try cachedScene(for: inputURL)
+                // 转换完成后立即释放场景。缓存完整 SCNScene 会让预览加载时仍保留
+                // 上一次转换的几何和纹理，峰值内存很容易翻倍。
+                let scene = try _loadSceneFresh(from: inputURL)
 
                 let success: Bool
                 switch format {
@@ -138,10 +102,11 @@ struct FormatConverter {
                         result(["path": NSNull(), "msg": "格式转换失败"] as [String: Any])
                     }
                 }
-            } catch {
+              } catch {
                 DispatchQueue.main.async {
                     result(["path": NSNull(), "msg": "格式转换异常: \(error.localizedDescription)"] as [String: Any])
                 }
+              }
             }
         }
     }
@@ -671,7 +636,17 @@ struct FormatConverter {
     }
 
     private static func writeGLTF(meshes: [MeshData], to outputURL: URL, binary: Bool) throws -> Bool {
-        var binData = Data()
+        let tempBinURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gltf_bin_\(UUID().uuidString).tmp")
+        _ = FileManager.default.createFile(atPath: tempBinURL.path, contents: nil)
+        let binHandle = try FileHandle(forWritingTo: tempBinURL)
+        var binHandleClosed = false
+        defer {
+            if !binHandleClosed { try? binHandle.close() }
+            try? FileManager.default.removeItem(at: tempBinURL)
+        }
+
+        var binLength = 0
         var bufferViews: [[String: Any]] = []
         var accessors:   [[String: Any]] = []
         var gltfMeshes:  [[String: Any]] = []
@@ -686,26 +661,55 @@ struct FormatConverter {
         var samplerByKey: [String: Int] = [:]
         var textureByKey: [String: Int] = [:]
 
-        func appendBuf(_ floats: [Float]) -> (Int, Int) {
-            let off = binData.count
-            floats.withUnsafeBytes { binData.append(contentsOf: $0) }
-            while binData.count % 4 != 0 { binData.append(0x00) }
-            return (off, binData.count - off)
+        func writeData(_ data: Data) throws {
+            try binHandle.write(contentsOf: data)
+            binLength += data.count
         }
-        func appendIdx(_ indices: [UInt32]) -> (Int, Int) {
-            let off = binData.count
-            indices.withUnsafeBytes { binData.append(contentsOf: $0) }
-            while binData.count % 4 != 0 { binData.append(0x00) }
-            return (off, binData.count - off)
+
+        // FileHandle 仍接收 Data，但每次最多创建 1 MB 临时块，避免把数百 MB
+        // 的 Float/UInt32 数组再完整复制一份到连续 Data 缓冲区。
+        func writeRawBuffer(_ buffer: UnsafeRawBufferPointer) throws {
+            guard let baseAddress = buffer.baseAddress, !buffer.isEmpty else { return }
+            let chunkSize = 1024 * 1024
+            var offset = 0
+            while offset < buffer.count {
+                let count = min(chunkSize, buffer.count - offset)
+                try autoreleasepool {
+                    let chunk = Data(bytes: baseAddress.advanced(by: offset), count: count)
+                    try writeData(chunk)
+                }
+                offset += count
+            }
         }
-        func appendRaw(_ data: Data) -> (Int, Int) {
-            let off = binData.count
-            binData.append(data)
+
+        func alignBinaryBuffer() throws {
+            let padding = (4 - binLength % 4) % 4
+            if padding > 0 { try writeData(Data(repeating: 0, count: padding)) }
+        }
+
+        func appendBuf(_ floats: [Float]) throws -> (Int, Int) {
+            let offset = binLength
+            try floats.withUnsafeBytes { try writeRawBuffer($0) }
+            let length = binLength - offset
+            try alignBinaryBuffer()
+            return (offset, length)
+        }
+
+        func appendIdx(_ indices: [UInt32]) throws -> (Int, Int) {
+            let offset = binLength
+            try indices.withUnsafeBytes { try writeRawBuffer($0) }
+            let length = binLength - offset
+            try alignBinaryBuffer()
+            return (offset, length)
+        }
+
+        func appendRaw(_ data: Data) throws -> (Int, Int) {
+            let offset = binLength
+            try writeData(data)
             // 返回真实长度（不含后续 4 字节对齐填充）
             // PNG/JPEG 解码器对 bufferView 末尾的零填充字节敏感，会导致图片读取失败→黑色材质
-            let actualLen = data.count
-            while binData.count % 4 != 0 { binData.append(0x00) }
-            return (off, actualLen)
+            try alignBinaryBuffer()
+            return (offset, data.count)
         }
         func addBV(_ off: Int, _ len: Int, _ tgt: Int) -> Int {
             bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": len, "target": tgt])
@@ -743,7 +747,7 @@ struct FormatConverter {
             samplerByKey[key] = index
             return index
         }
-        func imageIndex(for image: UIImage) -> Int? {
+        func imageIndex(for image: UIImage) throws -> Int? {
             let objectKey = ObjectIdentifier(image)
             if let existing = imageByObject[objectKey] { return existing }
             guard let (bytes, mimeType) = encodeTexture(image) else { return nil }
@@ -753,7 +757,7 @@ struct FormatConverter {
                 return existing
             }
 
-            let (offset, length) = appendRaw(bytes)
+            let (offset, length) = try appendRaw(bytes)
             let bufferView = addBVPlain(offset, length)
             let index = gltfImages.count
             gltfImages.append(["bufferView": bufferView, "mimeType": mimeType])
@@ -763,8 +767,8 @@ struct FormatConverter {
         }
         func addTexture(for image: UIImage,
                         wrapS: SCNWrapMode,
-                        wrapT: SCNWrapMode) -> Int? {
-            guard let imageIndex = imageIndex(for: image) else { return nil }
+                        wrapT: SCNWrapMode) throws -> Int? {
+            guard let imageIndex = try imageIndex(for: image) else { return nil }
             let samplerIndex = samplerIndex(wrapS: wrapS, wrapT: wrapT)
             let key = "\(imageIndex):\(samplerIndex)"
             if let existing = textureByKey[key] { return existing }
@@ -782,7 +786,7 @@ struct FormatConverter {
             ]
 
             if let texture = m.diffuseTexture,
-               let textureIndex = addTexture(
+               let textureIndex = try addTexture(
                 for: texture,
                 wrapS: m.textureWrapS,
                 wrapT: m.textureWrapT
@@ -794,7 +798,7 @@ struct FormatConverter {
 
             gltfMats.append(["pbrMetallicRoughness": pbrDict, "doubleSided": true])
 
-            let (pO, pL) = appendBuf(m.positions)
+            let (pO, pL) = try appendBuf(m.positions)
             let (minP, maxP) = computeBounds(m.positions)
             let bvP = addBV(pO, pL, 34962)
             let acP = addAC(bvP, 5126, m.vertexCount, "VEC3",
@@ -802,19 +806,19 @@ struct FormatConverter {
             var attrs: [String: Int] = ["POSITION": acP]
 
             if !m.normals.isEmpty {
-                let (o, l) = appendBuf(m.normals)
+                let (o, l) = try appendBuf(m.normals)
                 attrs["NORMAL"] = addAC(addBV(o, l, 34962), 5126, m.normals.count/3, "VEC3")
             }
             if !m.texCoords.isEmpty {
-                let (o, l) = appendBuf(m.texCoords)
+                let (o, l) = try appendBuf(m.texCoords)
                 attrs["TEXCOORD_0"] = addAC(addBV(o, l, 34962), 5126, m.texCoords.count/2, "VEC2")
             }
             if m.colors.count / 4 == m.vertexCount {
-                let (o, l) = appendBuf(m.colors)
+                let (o, l) = try appendBuf(m.colors)
                 attrs["COLOR_0"] = addAC(addBV(o, l, 34962), 5126, m.colors.count/4, "VEC4")
             }
 
-            let (iO, iL) = appendIdx(m.indices)
+            let (iO, iL) = try appendIdx(m.indices)
             let acI = addAC(addBV(iO, iL, 34963), 5125, m.indices.count, "SCALAR")
 
             gltfMeshes.append(["name": "Mesh_\(i)", "primitives": [
@@ -824,8 +828,9 @@ struct FormatConverter {
             nodeIndices.append(i)
         }
 
-        var bufEntry: [String: Any] = ["byteLength": binData.count]
-        if !binary { bufEntry["uri"] = "data:application/octet-stream;base64," + binData.base64EncodedString() }
+        var bufEntry: [String: Any] = ["byteLength": binLength]
+        let externalBinURL = outputURL.deletingPathExtension().appendingPathExtension("bin")
+        if !binary { bufEntry["uri"] = externalBinURL.lastPathComponent }
 
         var json: [String: Any] = [
             "asset": ["version": "2.0", "generator": "ObjectScannerPlugin-iOS"],
@@ -838,24 +843,76 @@ struct FormatConverter {
         if !gltfSamplers.isEmpty { json["samplers"] = gltfSamplers }
 
         let jsonData = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        try binHandle.close()
+        binHandleClosed = true
+
         if binary {
-            try writeGLBContainer(json: jsonData, bin: binData, to: outputURL)
+            try writeGLBContainer(
+                json: jsonData,
+                binURL: tempBinURL,
+                binLength: binLength,
+                to: outputURL
+            )
         } else {
+            try? FileManager.default.removeItem(at: externalBinURL)
+            try FileManager.default.moveItem(at: tempBinURL, to: externalBinURL)
             try jsonData.write(to: outputURL)
         }
         return true
     }
 
-    private static func writeGLBContainer(json: Data, bin: Data, to url: URL) throws {
-        var pJSON = json; while pJSON.count % 4 != 0 { pJSON.append(0x20) }
-        var pBin = bin;   while pBin.count % 4 != 0 { pBin.append(0x00) }
-        let total = 12 + 8 + pJSON.count + 8 + pBin.count
-        var glb = Data(capacity: total)
-        func u32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { glb.append(contentsOf: $0) } }
-        u32(0x46546C67); u32(2); u32(UInt32(total))
-        u32(UInt32(pJSON.count)); u32(0x4E4F534A); glb.append(pJSON)
-        u32(UInt32(pBin.count));  u32(0x004E4942); glb.append(pBin)
-        try glb.write(to: url)
+    private static func writeGLBContainer(json: Data,
+                                          binURL: URL,
+                                          binLength: Int,
+                                          to url: URL) throws {
+        var paddedJSON = json
+        while paddedJSON.count % 4 != 0 { paddedJSON.append(0x20) }
+        let paddedBinLength = binLength + (4 - binLength % 4) % 4
+        let total = 12 + 8 + paddedJSON.count + 8 + paddedBinLength
+        guard total <= Int(UInt32.max),
+              paddedJSON.count <= Int(UInt32.max),
+              paddedBinLength <= Int(UInt32.max) else {
+            throw convError("GLB 超过 4 GB 格式上限")
+        }
+
+        try? FileManager.default.removeItem(at: url)
+        _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+        let outputHandle = try FileHandle(forWritingTo: url)
+        defer { try? outputHandle.close() }
+
+        func writeUInt32(_ value: UInt32) throws {
+            var littleEndian = value.littleEndian
+            let data = withUnsafeBytes(of: &littleEndian) { Data($0) }
+            try outputHandle.write(contentsOf: data)
+        }
+
+        try writeUInt32(0x46546C67)
+        try writeUInt32(2)
+        try writeUInt32(UInt32(total))
+        try writeUInt32(UInt32(paddedJSON.count))
+        try writeUInt32(0x4E4F534A)
+        try outputHandle.write(contentsOf: paddedJSON)
+        try writeUInt32(UInt32(paddedBinLength))
+        try writeUInt32(0x004E4942)
+
+        let inputHandle = try FileHandle(forReadingFrom: binURL)
+        defer { try? inputHandle.close() }
+        var finished = false
+        while !finished {
+            try autoreleasepool {
+                let chunk = try inputHandle.read(upToCount: 1024 * 1024) ?? Data()
+                if chunk.isEmpty {
+                    finished = true
+                } else {
+                    try outputHandle.write(contentsOf: chunk)
+                }
+            }
+        }
+
+        let padding = paddedBinLength - binLength
+        if padding > 0 {
+            try outputHandle.write(contentsOf: Data(repeating: 0, count: padding))
+        }
     }
 
     // MARK: - 工具

@@ -28,10 +28,22 @@ class SwiftUIFactory: NSObject, FlutterPlatformViewFactory {
         
         // 创建一个单独 MethodChannel 给每个 PlatformView
         let channel = FlutterMethodChannel(name: "swift_ui_view_\(viewId)", binaryMessenger: messenger)
-        channel.setMethodCallHandler { call, result in
-            if call.method == "setParams", let params = call.arguments as? [String: Any] {
-                view.updateArgs(params)
+        view.attach(channel: channel)
+        channel.setMethodCallHandler { [weak view] call, result in
+            guard call.method == "setParams" else {
+                result(FlutterMethodNotImplemented)
+                return
             }
+            guard let params = call.arguments as? [String: Any] else {
+                result(FlutterError(
+                    code: "INVALID_ARGS",
+                    message: "setParams requires a map",
+                    details: nil
+                ))
+                return
+            }
+            view?.updateArgs(params)
+            result(nil)
         }
 
         return view
@@ -40,6 +52,7 @@ class SwiftUIFactory: NSObject, FlutterPlatformViewFactory {
 
 class SwiftUIPlatformView: NSObject, FlutterPlatformView {
     private var hostingController: UIHostingController<AnyView>?
+    private var methodChannel: FlutterMethodChannel?
 
     init(frame: CGRect) {
         super.init()
@@ -49,6 +62,10 @@ class SwiftUIPlatformView: NSObject, FlutterPlatformView {
 
     func view() -> UIView {
         return hostingController?.view ?? UIView()
+    }
+
+    func attach(channel: FlutterMethodChannel) {
+        methodChannel = channel
     }
 
     func updateArgs(_ params: [String: Any]) {
@@ -67,5 +84,13 @@ class SwiftUIPlatformView: NSObject, FlutterPlatformView {
         default:
             hostingController?.rootView = AnyView(Text("未知 SwiftUI View 类型"))
         }
+    }
+
+    deinit {
+        methodChannel?.setMethodCallHandler(nil)
+        methodChannel = nil
+        hostingController?.rootView = AnyView(EmptyView())
+        hostingController?.view.removeFromSuperview()
+        hostingController = nil
     }
 }
