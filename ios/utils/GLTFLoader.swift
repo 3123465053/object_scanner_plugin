@@ -263,7 +263,7 @@ struct GLTFLoader {
                 if let baseColorTex = pbr["baseColorTexture"] as? [String: Any],
                    let texIdx = baseColorTex["index"] as? Int,
                    texIdx < texturesArr.count,
-                   let imgIdx = texturesArr[texIdx]["source"] as? Int,
+                   let imgIdx = textureImageIndex(texturesArr[texIdx]),
                    imgIdx < images.count,
                    let image = images[imgIdx] {           // 解包 UIImage?，nil 则跳过
                     mat.diffuse.contents = image
@@ -296,7 +296,7 @@ struct GLTFLoader {
                 if let mrTex = pbr["metallicRoughnessTexture"] as? [String: Any],
                    let texIdx = mrTex["index"] as? Int,
                    texIdx < texturesArr.count,
-                   let imgIdx = texturesArr[texIdx]["source"] as? Int,
+                   let imgIdx = textureImageIndex(texturesArr[texIdx]),
                    imgIdx < images.count,
                    let image = images[imgIdx] {           // 解包 UIImage?
                     // GLTF: G 通道 = roughness, B 通道 = metallic
@@ -327,7 +327,7 @@ struct GLTFLoader {
             if let normalTex = matJson["normalTexture"] as? [String: Any],
                let texIdx = normalTex["index"] as? Int,
                texIdx < texturesArr.count,
-               let imgIdx = texturesArr[texIdx]["source"] as? Int,
+               let imgIdx = textureImageIndex(texturesArr[texIdx]),
                imgIdx < images.count,
                let image = images[imgIdx] {
                 mat.normal.contents = image
@@ -342,7 +342,7 @@ struct GLTFLoader {
             if let emissiveTex = matJson["emissiveTexture"] as? [String: Any],
                let texIdx = emissiveTex["index"] as? Int,
                texIdx < texturesArr.count,
-               let imgIdx = texturesArr[texIdx]["source"] as? Int,
+               let imgIdx = textureImageIndex(texturesArr[texIdx]),
                imgIdx < images.count,
                let image = images[imgIdx] {
                 mat.emission.contents = image
@@ -364,7 +364,7 @@ struct GLTFLoader {
             if let occTex = matJson["occlusionTexture"] as? [String: Any],
                let texIdx = occTex["index"] as? Int,
                texIdx < texturesArr.count,
-               let imgIdx = texturesArr[texIdx]["source"] as? Int,
+               let imgIdx = textureImageIndex(texturesArr[texIdx]),
                imgIdx < images.count,
                let image = images[imgIdx] {
                 mat.ambientOcclusion.contents = image
@@ -377,6 +377,17 @@ struct GLTFLoader {
 
             return mat
         }
+    }
+
+    /// EXT_texture_webp 把图像索引放在 extension.source 中；该字段也可能是
+    /// 唯一来源。其他压缩扩展需要独立解码器，不能在这里按普通图片处理。
+    private static func textureImageIndex(_ texture: [String: Any]) -> Int? {
+        if let extensions = texture["extensions"] as? [String: Any],
+           let webP = extensions["EXT_texture_webp"] as? [String: Any],
+           let source = webP["source"] as? Int {
+            return source
+        }
+        return texture["source"] as? Int
     }
 
     private static func configureSampling(for property: SCNMaterialProperty,
