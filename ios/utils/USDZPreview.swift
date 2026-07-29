@@ -78,7 +78,7 @@ class Model: ObservableObject {
     // MARK: - OBJ 纹理手动加载
 
     /// 按 MTL 的 newmtl → map_Kd 映射恢复 OBJ 材质。
-    private static func applyOBJTextures(scene: SCNScene, objURL: URL) {
+    static func applyOBJTextures(scene: SCNScene, objURL: URL) {
         let directory = objURL.deletingLastPathComponent()
         let mtlURL = directory.appendingPathComponent(
             objURL.deletingPathExtension().lastPathComponent + ".mtl"
@@ -88,13 +88,17 @@ class Model: ObservableObject {
             return
         }
 
+        var materialOrder: [String] = []
         var texturePaths: [String: String] = [:]
+        var diffuseColors: [String: UIColor] = [:]
         var currentMaterial: String?
         for line in contents.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.lowercased().hasPrefix("newmtl ") {
-                currentMaterial = String(trimmed.dropFirst(7))
+                let name = String(trimmed.dropFirst(7))
                     .trimmingCharacters(in: .whitespaces)
+                currentMaterial = name
+                if !name.isEmpty { materialOrder.append(name) }
             } else if trimmed.lowercased().hasPrefix("map_kd "),
                       let materialName = currentMaterial {
                 let relativePath = String(trimmed.dropFirst(7))
@@ -102,46 +106,83 @@ class Model: ObservableObject {
                 if !relativePath.isEmpty {
                     texturePaths[materialName] = relativePath
                 }
+            } else if trimmed.lowercased().hasPrefix("kd "),
+                      let materialName = currentMaterial {
+                let values = trimmed.dropFirst(3)
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .compactMap { Double($0) }
+                if values.count >= 3 {
+                    diffuseColors[materialName] = UIColor(
+                        red: CGFloat(values[0]),
+                        green: CGFloat(values[1]),
+                        blue: CGFloat(values[2]),
+                        alpha: 1
+                    )
+                }
             }
         }
 
-        guard !texturePaths.isEmpty else {
-            print("OBJ 预览：MTL 中没有 map_Kd")
+        guard !materialOrder.isEmpty else {
+            print("OBJ 预览：MTL 中没有材质定义")
             return
         }
-
-        var allMaterials: [SCNMaterial] = []
-        scene.rootNode.enumerateHierarchy { node, _ in
-            allMaterials.append(contentsOf: node.geometry?.materials ?? [])
+        if texturePaths.isEmpty {
+            print("OBJ 预览：MTL 中没有 map_Kd")
         }
 
         var imageCache: [String: UIImage] = [:]
         var assignedCount = 0
-        for (index, material) in allMaterials.enumerated() {
-            let generatedName = "mat_\(index)"
-            let materialName = material.name.flatMap { texturePaths[$0] == nil ? nil : $0 }
-                ?? (texturePaths[generatedName] == nil ? nil : generatedName)
-            guard let materialName,
-                  let relativePath = texturePaths[materialName] else {
-                material.isDoubleSided = true
-                continue
+        var materialSlotCount = 0
+
+        scene.rootNode.enumerateHierarchy { node, _ in
+            guard let geometry = node.geometry else { return }
+
+            // ModelIO 有时只保留 geometry elements，却把 materials 变成空数组。
+            // 每个 element 至少需要一个材质槽，否则后续 fixMaterials 会补成白色。
+            let requiredCount = max(1, max(geometry.elements.count, geometry.materials.count))
+            var materials = geometry.materials
+            while materials.count < requiredCount {
+                materials.append(SCNMaterial())
             }
 
-            let image: UIImage?
-            if let cached = imageCache[relativePath] {
-                image = cached
-            } else {
-                let loaded = UIImage(contentsOfFile: directory.appendingPathComponent(relativePath).path)
-                if let loaded { imageCache[relativePath] = loaded }
-                image = loaded
+            for slot in 0..<requiredCount {
+                let material = materials[slot]
+                let fallbackIndex = min(materialSlotCount, materialOrder.count - 1)
+                let fallbackName = materialOrder[fallbackIndex]
+                let materialName = material.name.flatMap { name in
+                    materialOrder.contains(name) ? name : nil
+                } ?? fallbackName
+                materialSlotCount += 1
+
+                material.name = materialName
+                material.lightingModel = .physicallyBased
+                material.isDoubleSided = true
+
+                if let relativePath = texturePaths[materialName] {
+                    let image: UIImage?
+                    if let cached = imageCache[relativePath] {
+                        image = cached
+                    } else {
+                        let loaded = UIImage(
+                            contentsOfFile: directory.appendingPathComponent(relativePath).path
+                        )
+                        if let loaded { imageCache[relativePath] = loaded }
+                        image = loaded
+                    }
+                    if let image {
+                        material.diffuse.contents = image
+                        assignedCount += 1
+                    } else if let color = diffuseColors[materialName] {
+                        material.diffuse.contents = color
+                    }
+                } else if let color = diffuseColors[materialName] {
+                    material.diffuse.contents = color
+                }
             }
-            if let image {
-                material.diffuse.contents = image
-                assignedCount += 1
-            }
-            material.isDoubleSided = true
+
+            geometry.materials = materials
         }
-        print("OBJ 预览：按 MTL 映射恢复 \(assignedCount)/\(allMaterials.count) 个材质")
+        print("OBJ 预览：按 MTL 映射恢复 \(assignedCount)/\(materialSlotCount) 个材质")
     }
 
     // MARK: - 材质修复

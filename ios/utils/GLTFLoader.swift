@@ -12,6 +12,22 @@ import ImageIO
 
 struct GLTFLoader {
 
+    /// GLB 的 bufferView 偏移是相对 BIN chunk 的。保留原始 mmap Data，并单独
+    /// 记录 chunk 起点，既避免整块复制，也保证所有读取都使用从 0 开始的相对偏移。
+    private struct BinaryBuffer {
+        let data: Data
+        let baseOffset: Int
+        let length: Int
+
+        func absoluteOffset(relativeOffset: Int, byteLength: Int) -> Int? {
+            guard relativeOffset >= 0,
+                  byteLength >= 0,
+                  relativeOffset <= length,
+                  byteLength <= length - relativeOffset else { return nil }
+            return baseOffset + relativeOffset
+        }
+    }
+
     /// 解析 GLB 或 GLTF 文件，返回 SCNScene
     static func loadScene(from url: URL) throws -> SCNScene {
         // .mappedIfSafe：大文件使用 mmap，避免将整个文件拷贝到堆内存
@@ -19,21 +35,25 @@ struct GLTFLoader {
         let ext = url.pathExtension.lowercased()
 
         let jsonObj: [String: Any]
-        let binData: Data
+        let binaryBuffer: BinaryBuffer
 
         if ext == "glb" {
-            (jsonObj, binData) = try parseGLBContainer(data)
+            (jsonObj, binaryBuffer) = try parseGLBContainer(data)
         } else {
             jsonObj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            binData = try loadBuffer(json: jsonObj, baseURL: url.deletingLastPathComponent())
+            binaryBuffer = try loadBuffer(json: jsonObj, baseURL: url.deletingLastPathComponent())
         }
 
-        return try buildScene(json: jsonObj, binData: binData, baseURL: url.deletingLastPathComponent())
+        return try buildScene(
+            json: jsonObj,
+            binaryBuffer: binaryBuffer,
+            baseURL: url.deletingLastPathComponent()
+        )
     }
 
     // MARK: - GLB 容器解析
 
-    private static func parseGLBContainer(_ data: Data) throws -> ([String: Any], Data) {
+    private static func parseGLBContainer(_ data: Data) throws -> ([String: Any], BinaryBuffer) {
         guard data.count >= 12 else { throw err("GLB 文件太小") }
         let magic: UInt32 = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self) }
         guard magic == 0x46546C67 else { throw err("无效的 GLB magic") }
@@ -41,43 +61,52 @@ struct GLTFLoader {
         let jsonChunkLen = Int(data.withUnsafeBytes { $0.load(fromByteOffset: 12, as: UInt32.self) })
         let jsonStart = 20
         guard jsonStart + jsonChunkLen <= data.count else { throw err("JSON chunk 越界") }
-        let jsonData = data[jsonStart..<(jsonStart + jsonChunkLen)]
+        // JSON chunk 通常很小，复制后得到从 0 开始的 Data，交给解析器更稳妥。
+        let jsonData = data.subdata(in: jsonStart..<(jsonStart + jsonChunkLen))
         let jsonObj = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] ?? [:]
 
-        var binData = Data()
+        var binaryBuffer = BinaryBuffer(data: data, baseOffset: 0, length: 0)
         let binChunkStart = jsonStart + jsonChunkLen
         if binChunkStart + 8 <= data.count {
             let binChunkLen = Int(data.withUnsafeBytes { $0.load(fromByteOffset: binChunkStart, as: UInt32.self) })
             let binStart = binChunkStart + 8
             if binStart + binChunkLen <= data.count {
-                // 保留 mmap 数据的切片视图，不再用 subdata 复制整个 BIN chunk。
-                // 大型 GLB 的 BIN 常达数百 MB，这一份复制足以触发 NSMallocException。
-                binData = data[binStart..<(binStart + binChunkLen)]
+                binaryBuffer = BinaryBuffer(
+                    data: data,
+                    baseOffset: binStart,
+                    length: binChunkLen
+                )
             }
         }
 
-        return (jsonObj, binData)
+        return (jsonObj, binaryBuffer)
     }
 
     // MARK: - GLTF buffer 加载
 
-    private static func loadBuffer(json: [String: Any], baseURL: URL) throws -> Data {
+    private static func loadBuffer(json: [String: Any], baseURL: URL) throws -> BinaryBuffer {
         guard let buffers = json["buffers"] as? [[String: Any]],
               let first = buffers.first,
-              let uri = first["uri"] as? String else { return Data() }
+              let uri = first["uri"] as? String else {
+            return BinaryBuffer(data: Data(), baseOffset: 0, length: 0)
+        }
 
         if uri.hasPrefix("data:"), let range = uri.range(of: ";base64,") {
-            return Data(base64Encoded: String(uri[range.upperBound...])) ?? Data()
+            let data = Data(base64Encoded: String(uri[range.upperBound...])) ?? Data()
+            return BinaryBuffer(data: data, baseOffset: 0, length: data.count)
         }
-        return try Data(
+        let data = try Data(
             contentsOf: baseURL.appendingPathComponent(uri),
             options: .mappedIfSafe
         )
+        return BinaryBuffer(data: data, baseOffset: 0, length: data.count)
     }
 
     // MARK: - 构建 SCNScene
 
-    private static func buildScene(json: [String: Any], binData: Data, baseURL: URL) throws -> SCNScene {
+    private static func buildScene(json: [String: Any],
+                                   binaryBuffer: BinaryBuffer,
+                                   baseURL: URL) throws -> SCNScene {
         let scene = SCNScene()
         guard let meshes = json["meshes"] as? [[String: Any]],
               let accessorsArr = json["accessors"] as? [[String: Any]],
@@ -86,7 +115,12 @@ struct GLTFLoader {
         }
 
         // 先解析图像和纹理，再解析材质
-        let images = loadImages(json: json, bufferViews: bufferViews, binData: binData, baseURL: baseURL)
+        let images = loadImages(
+            json: json,
+            bufferViews: bufferViews,
+            binaryBuffer: binaryBuffer,
+            baseURL: baseURL
+        )
         let materials = parseMaterials(json, images: images)
 
         for (meshIdx, mesh) in meshes.enumerated() {
@@ -96,19 +130,31 @@ struct GLTFLoader {
                 guard let attrs = prim["attributes"] as? [String: Int] else { continue }
                 guard let posIdx = attrs["POSITION"], posIdx < accessorsArr.count else { continue }
 
-                let positions = try readVec3(accessorsArr[posIdx], bufferViews: bufferViews, binData: binData)
+                let positions = try readVec3(
+                    accessorsArr[posIdx],
+                    bufferViews: bufferViews,
+                    binaryBuffer: binaryBuffer
+                )
                 guard !positions.isEmpty else { continue }
 
                 var sources: [SCNGeometrySource] = [SCNGeometrySource(vertices: positions)]
 
                 if let normIdx = attrs["NORMAL"], normIdx < accessorsArr.count,
-                   let normals = try? readVec3(accessorsArr[normIdx], bufferViews: bufferViews, binData: binData),
+                   let normals = try? readVec3(
+                       accessorsArr[normIdx],
+                       bufferViews: bufferViews,
+                       binaryBuffer: binaryBuffer
+                   ),
                    !normals.isEmpty {
                     sources.append(SCNGeometrySource(normals: normals))
                 }
 
                 if let texIdx = attrs["TEXCOORD_0"], texIdx < accessorsArr.count {
-                    let uvs = try readVec2(accessorsArr[texIdx], bufferViews: bufferViews, binData: binData)
+                    let uvs = try readVec2(
+                        accessorsArr[texIdx],
+                        bufferViews: bufferViews,
+                        binaryBuffer: binaryBuffer
+                    )
                     if !uvs.isEmpty {
                         sources.append(SCNGeometrySource(textureCoordinates: uvs))
                     }
@@ -116,7 +162,11 @@ struct GLTFLoader {
 
                 // 顶点颜色
                 if let colIdx = attrs["COLOR_0"], colIdx < accessorsArr.count {
-                    let colors = try readVertexColors(accessorsArr[colIdx], bufferViews: bufferViews, binData: binData)
+                    let colors = try readVertexColors(
+                        accessorsArr[colIdx],
+                        bufferViews: bufferViews,
+                        binaryBuffer: binaryBuffer
+                    )
                     if !colors.isEmpty {
                         let colorData = Data(bytes: colors, count: colors.count * MemoryLayout<Float>.size)
                         let colorSource = SCNGeometrySource(
@@ -135,7 +185,11 @@ struct GLTFLoader {
 
                 var elements: [SCNGeometryElement] = []
                 if let indicesIdx = prim["indices"] as? Int, indicesIdx < accessorsArr.count {
-                    let idxArray = try readScalar(accessorsArr[indicesIdx], bufferViews: bufferViews, binData: binData)
+                    let idxArray = try readScalar(
+                        accessorsArr[indicesIdx],
+                        bufferViews: bufferViews,
+                        binaryBuffer: binaryBuffer
+                    )
                     if !idxArray.isEmpty {
                         elements.append(SCNGeometryElement(indices: idxArray, primitiveType: .triangles))
                     }
@@ -173,7 +227,7 @@ struct GLTFLoader {
     /// 支持: bufferView 引用（GLB 内嵌）、data URI（base64）、外部文件 URI
     private static func loadImages(json: [String: Any],
                                    bufferViews: [[String: Any]],
-                                   binData: Data,
+                                   binaryBuffer: BinaryBuffer,
                                    baseURL: URL) -> [UIImage?] {
         guard let imagesArr = json["images"] as? [[String: Any]] else { return [] }
 
@@ -183,8 +237,15 @@ struct GLTFLoader {
                 let bv = bufferViews[bvIdx]
                 let offset = bv["byteOffset"] as? Int ?? 0
                 let length = bv["byteLength"] as? Int ?? 0
-                guard offset + length <= binData.count else { return nil }
-                let imageData = binData.subdata(in: offset..<(offset + length))
+                guard let absoluteOffset = binaryBuffer.absoluteOffset(
+                    relativeOffset: offset,
+                    byteLength: length
+                ) else { return nil }
+                // 只复制当前压缩图片，而不是复制整个 BIN。原始 Data 的索引从 0
+                // 开始，因此这里不会再触发 mmap 切片的 subdata 越界。
+                let imageData = binaryBuffer.data.subdata(
+                    in: absoluteOffset..<(absoluteOffset + length)
+                )
                 return decodeImage(from: imageData)
             }
 
@@ -443,7 +504,9 @@ struct GLTFLoader {
 
     // MARK: - Accessor 读取
 
-    private static func readVec3(_ accessor: [String: Any], bufferViews: [[String: Any]], binData: Data) throws -> [SCNVector3] {
+    private static func readVec3(_ accessor: [String: Any],
+                                 bufferViews: [[String: Any]],
+                                 binaryBuffer: BinaryBuffer) throws -> [SCNVector3] {
         guard let bvIdx = accessor["bufferView"] as? Int,
               let count = accessor["count"] as? Int,
               let compType = accessor["componentType"] as? Int,
@@ -456,11 +519,13 @@ struct GLTFLoader {
         var result: [SCNVector3] = []
         result.reserveCapacity(count)
 
-        binData.withUnsafeBytes { ptr in
+        binaryBuffer.data.withUnsafeBytes { ptr in
             for i in 0..<count {
                 let stride = byteStride > 0 ? byteStride : compSize(compType) * 3
-                let off = byteOffset + i * stride
-                guard off + compSize(compType) * 3 <= binData.count else { continue }
+                guard let off = binaryBuffer.absoluteOffset(
+                    relativeOffset: byteOffset + i * stride,
+                    byteLength: compSize(compType) * 3
+                ) else { continue }
                 let x: Float, y: Float, z: Float
                 switch compType {
                 case 5126:
@@ -475,7 +540,9 @@ struct GLTFLoader {
         return result
     }
 
-    private static func readVec2(_ accessor: [String: Any], bufferViews: [[String: Any]], binData: Data) throws -> [CGPoint] {
+    private static func readVec2(_ accessor: [String: Any],
+                                 bufferViews: [[String: Any]],
+                                 binaryBuffer: BinaryBuffer) throws -> [CGPoint] {
         guard let bvIdx = accessor["bufferView"] as? Int,
               let count = accessor["count"] as? Int,
               let compType = accessor["componentType"] as? Int,
@@ -488,11 +555,13 @@ struct GLTFLoader {
         var result: [CGPoint] = []
         result.reserveCapacity(count)
 
-        binData.withUnsafeBytes { ptr in
+        binaryBuffer.data.withUnsafeBytes { ptr in
             for i in 0..<count {
                 let stride = byteStride > 0 ? byteStride : compSize(compType) * 2
-                let off = byteOffset + i * stride
-                guard off + compSize(compType) * 2 <= binData.count else { continue }
+                guard let off = binaryBuffer.absoluteOffset(
+                    relativeOffset: byteOffset + i * stride,
+                    byteLength: compSize(compType) * 2
+                ) else { continue }
                 switch compType {
                 case 5126:
                     let u = ptr.load(fromByteOffset: off, as: Float.self)
@@ -505,7 +574,9 @@ struct GLTFLoader {
         return result
     }
 
-    private static func readScalar(_ accessor: [String: Any], bufferViews: [[String: Any]], binData: Data) throws -> [UInt32] {
+    private static func readScalar(_ accessor: [String: Any],
+                                   bufferViews: [[String: Any]],
+                                   binaryBuffer: BinaryBuffer) throws -> [UInt32] {
         guard let bvIdx = accessor["bufferView"] as? Int,
               let count = accessor["count"] as? Int,
               let compType = accessor["componentType"] as? Int,
@@ -517,10 +588,12 @@ struct GLTFLoader {
         var result: [UInt32] = []
         result.reserveCapacity(count)
 
-        binData.withUnsafeBytes { ptr in
+        binaryBuffer.data.withUnsafeBytes { ptr in
             for i in 0..<count {
-                let off = byteOffset + i * compSize(compType)
-                guard off + compSize(compType) <= binData.count else { continue }
+                guard let off = binaryBuffer.absoluteOffset(
+                    relativeOffset: byteOffset + i * compSize(compType),
+                    byteLength: compSize(compType)
+                ) else { continue }
                 switch compType {
                 case 5121: result.append(UInt32(ptr.load(fromByteOffset: off, as: UInt8.self)))
                 case 5123: result.append(UInt32(ptr.load(fromByteOffset: off, as: UInt16.self)))
@@ -533,7 +606,9 @@ struct GLTFLoader {
     }
 
     /// 读取顶点颜色（VEC3 或 VEC4，归一化 UNSIGNED_BYTE/SHORT 或 FLOAT）
-    private static func readVertexColors(_ accessor: [String: Any], bufferViews: [[String: Any]], binData: Data) throws -> [Float] {
+    private static func readVertexColors(_ accessor: [String: Any],
+                                         bufferViews: [[String: Any]],
+                                         binaryBuffer: BinaryBuffer) throws -> [Float] {
         guard let bvIdx = accessor["bufferView"] as? Int,
               let count = accessor["count"] as? Int,
               let compType = accessor["componentType"] as? Int,
@@ -549,29 +624,37 @@ struct GLTFLoader {
         var result: [Float] = []
         result.reserveCapacity(count * 4)
 
-        binData.withUnsafeBytes { ptr in
+        binaryBuffer.data.withUnsafeBytes { ptr in
             for i in 0..<count {
                 let stride = byteStride > 0 ? byteStride : compSize(compType) * components
-                let off = byteOffset + i * stride
                 var r: Float = 1, g: Float = 1, b: Float = 1, a: Float = 1
 
                 switch compType {
                 case 5126: // FLOAT
-                    if off + components * 4 <= binData.count {
+                    if let off = binaryBuffer.absoluteOffset(
+                        relativeOffset: byteOffset + i * stride,
+                        byteLength: components * 4
+                    ) {
                         r = ptr.load(fromByteOffset: off, as: Float.self)
                         g = ptr.load(fromByteOffset: off + 4, as: Float.self)
                         b = ptr.load(fromByteOffset: off + 8, as: Float.self)
                         if components == 4 { a = ptr.load(fromByteOffset: off + 12, as: Float.self) }
                     }
                 case 5121: // UNSIGNED_BYTE (normalized)
-                    if off + components <= binData.count {
+                    if let off = binaryBuffer.absoluteOffset(
+                        relativeOffset: byteOffset + i * stride,
+                        byteLength: components
+                    ) {
                         r = Float(ptr.load(fromByteOffset: off, as: UInt8.self)) / 255.0
                         g = Float(ptr.load(fromByteOffset: off + 1, as: UInt8.self)) / 255.0
                         b = Float(ptr.load(fromByteOffset: off + 2, as: UInt8.self)) / 255.0
                         if components == 4 { a = Float(ptr.load(fromByteOffset: off + 3, as: UInt8.self)) / 255.0 }
                     }
                 case 5123: // UNSIGNED_SHORT (normalized)
-                    if off + components * 2 <= binData.count {
+                    if let off = binaryBuffer.absoluteOffset(
+                        relativeOffset: byteOffset + i * stride,
+                        byteLength: components * 2
+                    ) {
                         r = Float(ptr.load(fromByteOffset: off, as: UInt16.self)) / 65535.0
                         g = Float(ptr.load(fromByteOffset: off + 2, as: UInt16.self)) / 65535.0
                         b = Float(ptr.load(fromByteOffset: off + 4, as: UInt16.self)) / 65535.0

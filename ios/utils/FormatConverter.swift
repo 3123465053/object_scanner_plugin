@@ -11,6 +11,15 @@ import SceneKit
 import Flutter
 import CoreImage
 
+/// SceneKit / ModelIO 都会在加载时产生较大的临时缓冲区。转换和预览共用同一
+/// 串行队列，避免两个模型同时解码导致瞬时内存翻倍。
+enum ModelWorkQueue {
+    static let shared = DispatchQueue(
+        label: "com.objectscanner.model-work",
+        qos: .userInitiated
+    )
+}
+
 struct FormatConverter {
 
     static let supportedFormats = [
@@ -204,6 +213,11 @@ struct FormatConverter {
         switch ext {
         case "glb", "gltf":
             return try GLTFLoader.loadScene(from: url)
+        case "obj":
+            let asset = MDLAsset(url: url)
+            let scene = SCNScene(mdlAsset: asset)
+            Model.applyOBJTextures(scene: scene, objURL: url)
+            return scene
         case "scn":
             return try SCNScene(url: url, options: nil)
         default:
@@ -1152,7 +1166,7 @@ struct FormatConverter {
             // ---- MTL ----
             // ★ Kd 必须在 map_Kd 之前：MDLAsset 把同一 semantic 的最后一条当最终值，
             //   若 Kd(white) 写在 map_Kd 之后，会覆盖纹理引用 → 预览全白
-            appendMTL("newmtl \(matName)\nKa 1.000 1.000 1.000\n")
+            appendMTL("newmtl \(matName)\nKa 0.000 0.000 0.000\n")
             if let fn = texFileName {
                 appendMTL("Kd 1.000 1.000 1.000\nmap_Kd \(fn)\n")  // Kd → 再写 map_Kd
             } else {
