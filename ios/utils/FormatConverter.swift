@@ -70,13 +70,32 @@ struct FormatConverter {
                 // SceneKit 原生写入
                 // ★ scene.write() 可能在内部修改 mat.diffuse.contents（UIImage → 内部纹理句柄），
                 //   先保存再还原，确保缓存的 SCNScene 对后续格式仍有效
-                case "usdz", "scn":
+                case "usdz":
+                    if inputURL.pathExtension.lowercased() == "ply" {
+                        let meshes = collectMeshData(from: scene.rootNode)
+                        guard !meshes.isEmpty else { throw convError("无有效几何数据") }
+                        success = try writeUSDZVertexColors(meshes: meshes, to: outputURL)
+                    } else {
+                        success = sceneWritePreserving(scene: scene, to: outputURL)
+                    }
+
+                case "scn":
                     success = sceneWritePreserving(scene: scene, to: outputURL)
 
                 // USD/USDA/USDC 必须把内存纹理先落盘，再由 SceneKit 直接写出。
                 // ModelIO 对 USDZ 二次导出会丢失 UsdPreviewSurface 材质网络。
                 case "usdc", "usda", "usd":
-                    success = try sceneWriteWithExternalTextures(scene: scene, to: outputURL)
+                    if inputURL.pathExtension.lowercased() == "ply" {
+                        let meshes = collectMeshData(from: scene.rootNode)
+                        guard !meshes.isEmpty else { throw convError("无有效几何数据") }
+                        if format == "usdc" {
+                            success = try writeUSDCVertexColors(meshes: meshes, to: outputURL)
+                        } else {
+                            success = try writeUSDVertexColors(meshes: meshes, to: outputURL)
+                        }
+                    } else {
+                        success = try sceneWriteWithExternalTextures(scene: scene, to: outputURL)
+                    }
 
                 // GLB/GLTF 自定义导出器
                 case "glb", "gltf":
@@ -203,6 +222,360 @@ struct FormatConverter {
         }
 
         return true
+    }
+
+    /// PLY 的颜色来自逐顶点 RGB。SceneKit 对 USDA 的顶点色写出不稳定，
+    /// 这里直接写标准 primvars:displayColor，USD/USDA 查看器都能识别。
+    private static func writeUSDVertexColors(meshes: [MeshData], to outputURL: URL) throws -> Bool {
+        try? FileManager.default.removeItem(at: outputURL)
+        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: outputURL)
+        defer { try? handle.close() }
+
+        var buffer = ""
+        buffer.reserveCapacity(600_000)
+        var pendingBytes = 0
+
+        func flush() throws {
+            guard !buffer.isEmpty else { return }
+            try handle.write(contentsOf: Data(buffer.utf8))
+            buffer.removeAll(keepingCapacity: true)
+            pendingBytes = 0
+        }
+
+        func append(_ value: String) throws {
+            buffer += value
+            pendingBytes += value.utf8.count
+            if pendingBytes >= 524_288 { try flush() }
+        }
+
+        try append("#usda 1.0\n(\n    defaultPrim = \"Root\"\n    metersPerUnit = 1\n    upAxis = \"Y\"\n)\n\ndef Xform \"Root\" {\n")
+
+        var writtenMeshes = 0
+        for (meshIndex, mesh) in meshes.enumerated() {
+            let vertexCount = mesh.vertexCount
+            guard vertexCount > 0, mesh.indices.count >= 3 else { continue }
+            writtenMeshes += 1
+
+            try append("    def Mesh \"Mesh_\(meshIndex)\" {\n")
+            try append("        uniform bool doubleSided = true\n")
+            try append("        uniform token subdivisionScheme = \"none\"\n")
+
+            try append("        point3f[] points = [")
+            for index in 0..<vertexCount {
+                let offset = index * 3
+                if index > 0 { try append(", ") }
+                try append("(\(mesh.positions[offset]), \(mesh.positions[offset + 1]), \(mesh.positions[offset + 2]))")
+            }
+            try append("]\n")
+
+            if mesh.normals.count / 3 == vertexCount {
+                try append("        normal3f[] normals = [")
+                for index in 0..<vertexCount {
+                    let offset = index * 3
+                    if index > 0 { try append(", ") }
+                    try append("(\(mesh.normals[offset]), \(mesh.normals[offset + 1]), \(mesh.normals[offset + 2]))")
+                }
+                try append("] (\n            interpolation = \"vertex\"\n        )\n")
+            }
+
+            try append("        color3f[] primvars:displayColor = [")
+            let hasVertexColors = mesh.colors.count / 4 == vertexCount
+            for index in 0..<vertexCount {
+                if index > 0 { try append(", ") }
+                if hasVertexColors {
+                    let offset = index * 4
+                    try append("(\(mesh.colors[offset]), \(mesh.colors[offset + 1]), \(mesh.colors[offset + 2]))")
+                } else {
+                    try append("(\(mesh.diffuseR), \(mesh.diffuseG), \(mesh.diffuseB))")
+                }
+            }
+            try append("] (\n            interpolation = \"vertex\"\n        )\n")
+
+            let faceCount = mesh.indices.count / 3
+            try append("        int[] faceVertexCounts = [")
+            for index in 0..<faceCount {
+                if index > 0 { try append(", ") }
+                try append("3")
+            }
+            try append("]\n")
+
+            try append("        int[] faceVertexIndices = [")
+            for index in 0..<(faceCount * 3) {
+                if index > 0 { try append(", ") }
+                try append("\(mesh.indices[index])")
+            }
+            try append("]\n    }\n")
+        }
+
+        try append("}\n")
+        try flush()
+        return writtenMeshes > 0
+    }
+
+    /// ModelIO 能把 MDLVertexAttributeColor 稳定映射为 USDC 的
+    /// primvars:displayColor；直接导出原始 SCNScene 在部分系统版本会漏掉该属性。
+    private static func writeUSDCVertexColors(meshes: [MeshData], to outputURL: URL) throws -> Bool {
+        guard MDLAsset.canExportFileExtension("usdc") else {
+            throw convError("当前系统不支持 USDC 导出")
+        }
+
+        let allocator = MDLMeshBufferDataAllocator()
+        let asset = MDLAsset(bufferAllocator: allocator)
+        asset.upAxis = SIMD3<Float>(0, 1, 0)
+        var meshCount = 0
+
+        for (meshIndex, mesh) in meshes.enumerated() {
+            let vertexCount = mesh.vertexCount
+            guard vertexCount > 0,
+                  mesh.indices.count >= 3,
+                  mesh.colors.count / 4 == vertexCount else { continue }
+
+            let positionBuffer = allocator.newBuffer(
+                with: rawData(mesh.positions),
+                type: .vertex
+            )
+            let colorBuffer = allocator.newBuffer(
+                with: rawData(mesh.colors),
+                type: .vertex
+            )
+            let indexBuffer = allocator.newBuffer(
+                with: rawData(mesh.indices),
+                type: .index
+            )
+
+            var vertexBuffers: [MDLMeshBuffer] = [positionBuffer, colorBuffer]
+            let descriptor = MDLVertexDescriptor()
+            descriptor.attributes[0] = MDLVertexAttribute(
+                name: MDLVertexAttributePosition,
+                format: .float3,
+                offset: 0,
+                bufferIndex: 0
+            )
+            descriptor.layouts[0] = MDLVertexBufferLayout(stride: 12)
+            descriptor.attributes[1] = MDLVertexAttribute(
+                name: MDLVertexAttributeColor,
+                format: .float4,
+                offset: 0,
+                bufferIndex: 1
+            )
+            descriptor.layouts[1] = MDLVertexBufferLayout(stride: 16)
+
+            if mesh.normals.count / 3 == vertexCount {
+                let normalBuffer = allocator.newBuffer(
+                    with: rawData(mesh.normals),
+                    type: .vertex
+                )
+                vertexBuffers.append(normalBuffer)
+                descriptor.attributes[2] = MDLVertexAttribute(
+                    name: MDLVertexAttributeNormal,
+                    format: .float3,
+                    offset: 0,
+                    bufferIndex: 2
+                )
+                descriptor.layouts[2] = MDLVertexBufferLayout(stride: 12)
+            }
+
+            let submesh = MDLSubmesh(
+                indexBuffer: indexBuffer,
+                indexCount: mesh.indices.count,
+                indexType: .uInt32,
+                geometryType: .triangles,
+                material: nil
+            )
+            let mdlMesh = MDLMesh(
+                vertexBuffers: vertexBuffers,
+                vertexCount: vertexCount,
+                descriptor: descriptor,
+                submeshes: [submesh]
+            )
+            mdlMesh.name = "ColorMesh_\(meshIndex)"
+            asset.add(mdlMesh)
+            meshCount += 1
+        }
+
+        guard meshCount > 0 else { throw convError("PLY 中没有可导出的顶点色") }
+        try? FileManager.default.removeItem(at: outputURL)
+        try asset.export(to: outputURL)
+        try disableModelIODefaultMaterialBinding(in: outputURL)
+
+        let size = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard size > 0 else { throw convError("USDC 输出文件为空") }
+        return true
+    }
+
+    /// ModelIO 会给没有材质的彩色网格自动绑定一个空的 Default 材质。该绑定会
+    /// 遮住 primvars:displayColor，SceneKit 读取后甚至不会暴露 color source。
+    /// USDC 的 token 字符串由所有网格共享；等长改名即可取消绑定且不改变 crate
+    /// 的任何偏移。使用分块原位扫描，避免大型模型再产生一份完整 Data 副本。
+    private static func disableModelIODefaultMaterialBinding(in url: URL) throws {
+        let needle = Data(":binding\0".utf8)
+        let replacement = Data("_".utf8)
+        let overlapCount = needle.count - 1
+        let handle = try FileHandle(forUpdating: url)
+        defer { try? handle.close() }
+
+        var carry = Data()
+        var bytesRead: UInt64 = 0
+        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            var window = carry
+            window.append(chunk)
+            if let range = window.range(of: needle) {
+                let windowStart = bytesRead - UInt64(carry.count)
+                let patchOffset = windowStart + UInt64(range.lowerBound)
+                try handle.seek(toOffset: patchOffset)
+                try handle.write(contentsOf: replacement)
+                return
+            }
+
+            carry = Data(window.suffix(overlapCount))
+            bytesRead += UInt64(chunk.count)
+        }
+
+        throw convError("USDC 默认材质绑定未找到")
+    }
+
+    /// USDZ 是无压缩 ZIP，且每个文件的数据起点必须按 64 字节对齐。先生成标准
+    /// displayColor USDA，再按 USDZ 规范封装，绕开 SceneKit 丢顶点色的问题。
+    private static func writeUSDZVertexColors(meshes: [MeshData], to outputURL: URL) throws -> Bool {
+        let temporaryUSDA = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vertex_colors_\(UUID().uuidString).usda")
+        defer { try? FileManager.default.removeItem(at: temporaryUSDA) }
+
+        guard try writeUSDVertexColors(meshes: meshes, to: temporaryUSDA) else {
+            throw convError("无法生成彩色 USDA")
+        }
+        let archivedName = outputURL.deletingPathExtension().lastPathComponent + ".usda"
+        try writeUSDZArchive(fileURL: temporaryUSDA, archivedName: archivedName, to: outputURL)
+
+        let size = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard size > 0 else { throw convError("USDZ 输出文件为空") }
+        return true
+    }
+
+    private static func rawData<T>(_ values: [T]) -> Data {
+        values.withUnsafeBytes { Data($0) }
+    }
+
+    private static func writeUSDZArchive(fileURL: URL,
+                                         archivedName: String,
+                                         to outputURL: URL) throws {
+        let fileSize64 = try fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard fileSize64 >= 0, UInt64(fileSize64) <= UInt64(UInt32.max) else {
+            throw convError("USDZ 根文件超过 4 GB 上限")
+        }
+        guard let nameData = archivedName.data(using: .utf8),
+              nameData.count <= Int(UInt16.max) else {
+            throw convError("USDZ 文件名无效")
+        }
+
+        let crc = try crc32(of: fileURL)
+        let fileSize = UInt32(fileSize64)
+        let baseHeaderLength = 30 + nameData.count
+        var extraLength = (64 - (baseHeaderLength % 64)) % 64
+        if extraLength > 0 && extraLength < 4 { extraLength += 64 }
+        guard extraLength <= Int(UInt16.max) else { throw convError("USDZ 对齐数据无效") }
+
+        var extra = Data()
+        if extraLength > 0 {
+            appendLittleEndian(UInt16(0x1986), to: &extra)
+            appendLittleEndian(UInt16(extraLength - 4), to: &extra)
+            extra.append(Data(repeating: 0, count: extraLength - 4))
+        }
+
+        try? FileManager.default.removeItem(at: outputURL)
+        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        let output = try FileHandle(forWritingTo: outputURL)
+        defer { try? output.close() }
+
+        var localHeader = Data()
+        appendLittleEndian(UInt32(0x04034b50), to: &localHeader)
+        appendLittleEndian(UInt16(10), to: &localHeader)
+        appendLittleEndian(UInt16(0), to: &localHeader)
+        appendLittleEndian(UInt16(0), to: &localHeader)
+        appendLittleEndian(UInt16(0), to: &localHeader)
+        appendLittleEndian(UInt16(0), to: &localHeader)
+        appendLittleEndian(crc, to: &localHeader)
+        appendLittleEndian(fileSize, to: &localHeader)
+        appendLittleEndian(fileSize, to: &localHeader)
+        appendLittleEndian(UInt16(nameData.count), to: &localHeader)
+        appendLittleEndian(UInt16(extra.count), to: &localHeader)
+        try output.write(contentsOf: localHeader)
+        try output.write(contentsOf: nameData)
+        try output.write(contentsOf: extra)
+
+        let input = try FileHandle(forReadingFrom: fileURL)
+        defer { try? input.close() }
+        while let chunk = try input.read(upToCount: 1_048_576), !chunk.isEmpty {
+            try output.write(contentsOf: chunk)
+        }
+
+        let centralDirectoryOffset64 = UInt64(baseHeaderLength + extra.count) + UInt64(fileSize)
+        guard centralDirectoryOffset64 <= UInt64(UInt32.max) else {
+            throw convError("USDZ 中央目录偏移超过格式上限")
+        }
+
+        var centralHeader = Data()
+        appendLittleEndian(UInt32(0x02014b50), to: &centralHeader)
+        appendLittleEndian(UInt16(10), to: &centralHeader)
+        appendLittleEndian(UInt16(10), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(crc, to: &centralHeader)
+        appendLittleEndian(fileSize, to: &centralHeader)
+        appendLittleEndian(fileSize, to: &centralHeader)
+        appendLittleEndian(UInt16(nameData.count), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt16(0), to: &centralHeader)
+        appendLittleEndian(UInt32(0), to: &centralHeader)
+        appendLittleEndian(UInt32(0), to: &centralHeader)
+        try output.write(contentsOf: centralHeader)
+        try output.write(contentsOf: nameData)
+
+        let centralDirectorySize = centralHeader.count + nameData.count
+        var endRecord = Data()
+        appendLittleEndian(UInt32(0x06054b50), to: &endRecord)
+        appendLittleEndian(UInt16(0), to: &endRecord)
+        appendLittleEndian(UInt16(0), to: &endRecord)
+        appendLittleEndian(UInt16(1), to: &endRecord)
+        appendLittleEndian(UInt16(1), to: &endRecord)
+        appendLittleEndian(UInt32(centralDirectorySize), to: &endRecord)
+        appendLittleEndian(UInt32(centralDirectoryOffset64), to: &endRecord)
+        appendLittleEndian(UInt16(0), to: &endRecord)
+        try output.write(contentsOf: endRecord)
+    }
+
+    private static func crc32(of url: URL) throws -> UInt32 {
+        var table = [UInt32](repeating: 0, count: 256)
+        for index in 0..<256 {
+            var value = UInt32(index)
+            for _ in 0..<8 {
+                value = (value & 1) != 0
+                    ? 0xedb88320 ^ (value >> 1)
+                    : value >> 1
+            }
+            table[index] = value
+        }
+
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var crc = UInt32.max
+        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            for byte in chunk {
+                let tableIndex = Int((crc ^ UInt32(byte)) & 0xff)
+                crc = table[tableIndex] ^ (crc >> 8)
+            }
+        }
+        return crc ^ UInt32.max
+    }
+
+    private static func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
 
     // MARK: - 输入加载
@@ -627,6 +1000,8 @@ struct FormatConverter {
         guard let contents = contents else { return nil }
 
         if let img = contents as? UIImage { return img }
+        // SCN 文件会把内嵌 PNG/JPEG 解档为 NSConcreteMutableData。
+        if let data = contents as? Data { return UIImage(data: data) }
         if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
             return UIImage(cgImage: contents as! CGImage)
         }
@@ -794,6 +1169,7 @@ struct FormatConverter {
 
         for (i, m) in meshes.enumerated() {
             let matIdx = gltfMats.count
+            let hasVertexColors = m.colors.count / 4 == m.vertexCount
             var pbrDict: [String: Any] = [
                 "metallicFactor": m.metallic,
                 "roughnessFactor": m.roughness
@@ -806,6 +1182,10 @@ struct FormatConverter {
                 wrapT: m.textureWrapT
                ) {
                 pbrDict["baseColorTexture"] = ["index": textureIndex]
+            } else if hasVertexColors {
+                // GLTF 会将 COLOR_0 与 baseColorFactor 相乘。顶点色模型必须用白色
+                // 底色，否则 PLY 自带的 RGB 会被 SceneKit 材质色压暗或乘成黑色。
+                pbrDict["baseColorFactor"] = [1.0, 1.0, 1.0, 1.0]
             } else {
                 pbrDict["baseColorFactor"] = [m.diffuseR, m.diffuseG, m.diffuseB, 1.0]
             }
@@ -827,7 +1207,7 @@ struct FormatConverter {
                 let (o, l) = try appendBuf(m.texCoords)
                 attrs["TEXCOORD_0"] = addAC(addBV(o, l, 34962), 5126, m.texCoords.count/2, "VEC2")
             }
-            if m.colors.count / 4 == m.vertexCount {
+            if hasVertexColors {
                 let (o, l) = try appendBuf(m.colors)
                 attrs["COLOR_0"] = addAC(addBV(o, l, 34962), 5126, m.colors.count/4, "VEC4")
             }
@@ -1145,6 +1525,8 @@ struct FormatConverter {
 
         for (i, m) in meshes.enumerated() {
             let matName = "mat_\(i)"
+            let vc = m.vertexCount
+            let hasVertexColors = m.colors.count / 4 == vc
 
             // ---- 导出纹理文件（去重：同一 UIImage 实例只写一次）----
             var texFileName: String? = nil
@@ -1169,16 +1551,27 @@ struct FormatConverter {
             appendMTL("newmtl \(matName)\nKa 0.000 0.000 0.000\n")
             if let fn = texFileName {
                 appendMTL("Kd 1.000 1.000 1.000\nmap_Kd \(fn)\n")  // Kd → 再写 map_Kd
+            } else if hasVertexColors {
+                // PLY 等格式只有顶点色。OBJ 没有正式标准，但 v x y z r g b
+                // 是 Blender、MeshLab 等工具通用的顶点色扩展。
+                appendMTL("Kd 1.000 1.000 1.000\n")
             } else {
                 appendMTL("Kd \(m.diffuseR) \(m.diffuseG) \(m.diffuseB)\n")
             }
             appendMTL("Ks 0.000 0.000 0.000\nillum 2\n\n")
 
             // ---- 顶点坐标 ----
-            let vc = m.vertexCount
             for vi in 0..<vc {
                 let b = vi * 3
-                appendOBJ("v \(m.positions[b]) \(m.positions[b+1]) \(m.positions[b+2])\n")
+                if hasVertexColors {
+                    let colorOffset = vi * 4
+                    appendOBJ(
+                        "v \(m.positions[b]) \(m.positions[b+1]) \(m.positions[b+2]) " +
+                        "\(m.colors[colorOffset]) \(m.colors[colorOffset + 1]) \(m.colors[colorOffset + 2])\n"
+                    )
+                } else {
+                    appendOBJ("v \(m.positions[b]) \(m.positions[b+1]) \(m.positions[b+2])\n")
+                }
             }
 
             // ---- 纹理坐标（★ GLTF V=0 在顶部，OBJ V=0 在底部，需要翻转 V = 1 - v）----

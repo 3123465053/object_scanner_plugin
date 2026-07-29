@@ -189,46 +189,52 @@ class Model: ObservableObject {
 
     private static func fixMaterials(_ node: SCNNode, ext: String) {
         if let geo = node.geometry {
-            switch ext {
-            case "ply":
+            let vertexColorFormats = Set(["ply", "usd", "usda", "usdc", "usdz"])
+            let hasVertexColors = !geo.sources(for: .color).isEmpty
+            let hasTexture = geo.materials.contains { material in
+                guard let contents = material.diffuse.contents else { return false }
+                return !(contents is UIColor) && !(contents is NSNumber)
+            }
+
+            if vertexColorFormats.contains(ext), hasVertexColors, !hasTexture {
                 let gammaFix: [SCNShaderModifierEntryPoint: String] = [
                     .fragment: "_output.color.rgb = pow(_output.color.rgb, float3(2.2));"
                 ]
-                for mat in geo.materials {
+                var materials = geo.materials
+                if materials.isEmpty {
+                    let mat = SCNMaterial()
+                    materials = [mat]
+                }
+                for mat in materials {
                     mat.lightingModel = .constant
                     mat.diffuse.contents = UIColor.white
                     mat.shaderModifiers = gammaFix
                     mat.isDoubleSided = true
                 }
-                if geo.materials.isEmpty {
+                geo.materials = materials
+            } else {
+                switch ext {
+                case "stl":
                     let mat = SCNMaterial()
-                    mat.lightingModel = .constant
-                    mat.diffuse.contents = UIColor.white
-                    mat.shaderModifiers = gammaFix
+                    mat.lightingModel = .physicallyBased
+                    mat.diffuse.contents = UIColor(red: 0.8, green: 0.8, blue: 0.8, alpha: 1.0)
+                    mat.metalness.contents = 0.1
+                    mat.roughness.contents = 0.6
                     mat.isDoubleSided = true
                     geo.materials = [mat]
-                }
 
-            case "stl":
-                let mat = SCNMaterial()
-                mat.lightingModel = .physicallyBased
-                mat.diffuse.contents = UIColor(red: 0.8, green: 0.8, blue: 0.8, alpha: 1.0)
-                mat.metalness.contents = 0.1
-                mat.roughness.contents = 0.6
-                mat.isDoubleSided = true
-                geo.materials = [mat]
-
-            default:
-                if geo.materials.isEmpty {
-                    geo.materials = [defaultMaterial()]
-                } else {
-                    // 已有纹理（map 或 UIImage）则不覆盖；全空才替换
-                    let hasContent = geo.materials.contains {
-                        $0.diffuse.contents != nil
+                default:
+                    if geo.materials.isEmpty {
+                        geo.materials = [defaultMaterial()]
+                    } else {
+                        // 已有纹理（map 或 UIImage）则不覆盖；全空才替换
+                        let hasContent = geo.materials.contains {
+                            $0.diffuse.contents != nil
+                        }
+                        if !hasContent { geo.materials = [defaultMaterial()] }
                     }
-                    if !hasContent { geo.materials = [defaultMaterial()] }
+                    for mat in geo.materials { mat.isDoubleSided = true }
                 }
-                for mat in geo.materials { mat.isDoubleSided = true }
             }
 
             for material in geo.materials {
